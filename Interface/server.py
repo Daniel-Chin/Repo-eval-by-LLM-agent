@@ -18,7 +18,6 @@ from env import SERVER_IP, SERVER_PORT
 def run_command(command, output_queue):
     process = subprocess.Popen(
         command,
-        shell=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True
