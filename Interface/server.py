@@ -8,9 +8,10 @@ import os
 from openai import OpenAI
 
 from dotenv import load_dotenv, find_dotenv
-_ = load_dotenv(find_dotenv())
 
-os.environ['OPENAI_API_KEY'] = "API_KEY_HERE"
+assert load_dotenv(find_dotenv('openai_api.env'))
+
+# os.environ['OPENAI_API_KEY'] = "API_KEY_HERE"
 
 # Function to run the command and return stdout and stderr
 def run_command(command, output_queue):
