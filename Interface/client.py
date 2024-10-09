@@ -1,8 +1,6 @@
 import socket
 
-# Define the server's IP address and port
-SERVER_IP = '10.0.0.22'  # Replace with the Ubuntu VM's IP address
-SERVER_PORT = 5001
+from env import SERVER_IP, SERVER_PORT
 
 def send_message(message):
     # Create a socket object

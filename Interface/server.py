@@ -10,8 +10,9 @@ from openai import OpenAI
 from dotenv import load_dotenv, find_dotenv
 
 assert load_dotenv(find_dotenv('openai_api.env'))
-
 # os.environ['OPENAI_API_KEY'] = "API_KEY_HERE"
+
+from env import SERVER_IP, SERVER_PORT
 
 # Function to run the command and return stdout and stderr
 def run_command(command, output_queue):
@@ -45,6 +46,7 @@ def run_command(command, output_queue):
 # Function to periodically check the output
 def check_output_periodically(output_queue):
     while True:
+        print(output_queue.empty())
         if not output_queue.empty():
             output_type, content = output_queue.get()
             if output_type == "done":
@@ -77,10 +79,6 @@ def handle_ctrl_c(signum, frame):
 
 # Main function to handle incoming commands and GPT integration
 def handle_client_commands():
-    # Define the server IP address and port
-    SERVER_IP = '10.0.0.22'  # VM IP
-    SERVER_PORT = 5001
-
     # Create a socket object
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((SERVER_IP, SERVER_PORT))
