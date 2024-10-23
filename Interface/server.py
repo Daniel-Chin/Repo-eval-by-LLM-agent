@@ -6,57 +6,45 @@ import signal
 import openai
 import os
 from openai import OpenAI
+import subprocess
 
 from dotenv import load_dotenv, find_dotenv
 
 assert load_dotenv(find_dotenv('openai_api.env'))
-# os.environ['OPENAI_API_KEY'] = "API_KEY_HERE"
+openai_api_key = os.getenv('OPENAI_API_KEY')
 
 from env import SERVER_IP, SERVER_PORT
 
 # Function to run the command and return stdout and stderr
-def run_command(command, output_queue):
+def run_command(command):
     process = subprocess.Popen(
-        command,
+        command.split(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True
     )
 
-    while True:
-        retcode = process.poll()
-        stdout_line = process.stdout.readline().strip()
-        stderr_line = process.stderr.readline().strip()
-
-        if stdout_line:
-            output_queue.put(("stdout", stdout_line))
-        if stderr_line:
-            output_queue.put(("stderr", stderr_line))
-
-        if retcode is not None:
-            break
+    def read_output(pipe):
+        while True:
+            output = pipe.readline()
+            if output:
+                print(output.strip())
+            else:
+                break
 
         time.sleep(0.1)
 
-    process.stdout.close()
-    process.stderr.close()
-    output_queue.put(("done", process.returncode))
+    stdout_reader = multiprocessing.Process(target=read_output, args=(process.stdout,))
+    stderr_reader = multiprocessing.Process(target=read_output, args=(process.stderr,))
 
-# Function to periodically check the output
-def check_output_periodically(output_queue):
-    while True:
-        print(output_queue.empty())
-        if not output_queue.empty():
-            output_type, content = output_queue.get()
-            if output_type == "done":
-                print(f"Subprocess finished with return code: {content}")
-                break
-            elif output_type == "stdout":
-                print(f"Standard Output: {content}")
-            elif output_type == "stderr":
-                print(f"Standard Error: {content}")
+    stdout_reader.start()
+    stderr_reader.start()
 
-        time.sleep(10)
+    process.wait()
+
+    stdout_reader.join()
+    stderr_reader.join()
+
 
 # GPT interaction function
 def interact_with_gpt(chat_history):
@@ -137,7 +125,7 @@ def handle_client_commands():
     print(f"Chain of thought:\n{chain_of_thought}")
 
     # GPT generates the first terminal command
-    gpt_command = interact_with_gpt(chat_history)
+    gpt_command = interact_with_gpt(chat_history).replace("```bash", "").replace("```", "").strip()
     print(f"GPT command:\n{gpt_command}")
 
     while True:
@@ -146,21 +134,16 @@ def handle_client_commands():
             break
         
         print('while True entered')
-        # Shared output queue for subprocess communication
-        output_queue = multiprocessing.Queue()
-
-        # Create subprocess and output checking process
-        command_process = multiprocessing.Process(target=run_command, args=(gpt_command, output_queue))
-        output_process = multiprocessing.Process(target=check_output_periodically, args=(output_queue,))
-        print('multiprocess set')
-        # Start both processes
+        
+        # Run the command in a separate process
+        command_process = multiprocessing.Process(target=run_command, args=(gpt_command,))
         command_process.start()
-        output_process.start()
         print('multiprocess started')
-        # Wait for both processes to finish
+        
+        # Wait for the command process to finish
         command_process.join()
-        output_process.join()
         print('multiprocess joined')
+
         # Send acknowledgment or result back to client
         client_socket.send("Command executed".encode('utf-8'))
 
