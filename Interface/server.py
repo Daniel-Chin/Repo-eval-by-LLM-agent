@@ -16,13 +16,16 @@ openai_api_key = os.getenv('OPENAI_API_KEY')
 from env import SERVER_IP, SERVER_PORT
 
 # Function to run the command and return stdout and stderr
-def run_command(command):
+def run_command(command, current_directory):
+    print(command.split())
     process = subprocess.Popen(
         command.split(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True
+        text=True,
+        cwd=current_directory
     )
+    
 
     def read_output(pipe):
         while True:
@@ -64,8 +67,21 @@ def handle_ctrl_c(signum, frame):
     print("Ctrl+C received, stopping execution.")
     raise KeyboardInterrupt
 
+def handle_cd_command(directory):
+    if not os.path.isabs(directory):
+        directory = os.path.join("/home/yw5343", directory)
+
+    try:
+        os.chdir(directory)
+        print(f"Changed directory to {directory}")
+    except FileNotFoundError:
+        print(f"Directory '{directory}' does not exist.")
+
 # Main function to handle incoming commands and GPT integration
 def handle_client_commands():
+
+    current_directory = "/home/yw5343"
+
     # Create a socket object
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((SERVER_IP, SERVER_PORT))
@@ -100,7 +116,8 @@ def handle_client_commands():
     Make system calls to fix any possible errors during running.
 
     Please note:
-    Always place the command in the very first line of your response without any additional characters.
+    Always reply ONLY the command in your response WITHOUT any other expianation. Strictly no more than one at each time.
+    The current category is not saved. Each time when you want to change the direction, please include the full direction.
     Sometimes the command will not lead to an output but can still finish executing the command. In that case, the output provided to you will also be empty.
     If you think the testing is finished or you want to stop the process at any time, please put 'stop' for the command.
     """ 
@@ -133,23 +150,41 @@ def handle_client_commands():
             print("Process finished by GPT.")
             break
         
-        print('while True entered')
-        
+        # change dir if the command is "cd"
+        if gpt_command.startswith("cd"):
+            target_directory = gpt_command.split()[1]
+            # handle_cd_command(target_directory)
+            if not os.path.isabs(target_directory):
+                target_directory = os.path.join(current_directory, target_directory)
+            try:
+                os.chdir(target_directory)
+                current_directory = target_directory
+                print(f"Changed directory to {current_directory}")
+            except FileNotFoundError:
+                print(f"Directory '{target_directory}' does not exist.")
+            gpt_command = interact_with_gpt(chat_history).replace("```bash", "").replace("```", "").strip()
+            print(f"GPT command:\n{gpt_command}")
+            chat_history.append({"role": "user", "content": gpt_command})
+            continue
+
         # Run the command in a separate process
-        command_process = multiprocessing.Process(target=run_command, args=(gpt_command,))
+        command_process = multiprocessing.Process(target=run_command, args=(gpt_command, current_directory))
         command_process.start()
-        print('multiprocess started')
         
         # Wait for the command process to finish
         command_process.join()
-        print('multiprocess joined')
 
         # Send acknowledgment or result back to client
         client_socket.send("Command executed".encode('utf-8'))
 
-        # Update chat history with output
-        gpt_command = interact_with_gpt(chat_history)
+        chain_of_thought = interact_with_gpt(chat_history)
+        print(f"Chain of thought:\n{chain_of_thought}")
+
+        gpt_command = interact_with_gpt(chat_history).replace("```bash", "").replace("```", "").strip()
+        print(f"GPT command:\n{gpt_command}")
+
         chat_history.append({"role": "user", "content": gpt_command})
+
 
     client_socket.close()
     server_socket.close()
