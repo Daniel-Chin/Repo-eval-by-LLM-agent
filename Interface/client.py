@@ -14,7 +14,7 @@ def send_message(message):
         client_socket.send(message.encode('utf-8'))
 
         # Receive a response from the server
-        response = client_socket.recv(1024).decode('utf-8')
+        response = client_socket.recv(4096).decode('utf-8')
         print(f"Received from server: {response}")
 
     finally:
