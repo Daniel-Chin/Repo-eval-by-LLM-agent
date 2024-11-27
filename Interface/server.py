@@ -1,23 +1,23 @@
 import socket
 import subprocess
-import multiprocessing
+import threading
 import time
 import signal
 import openai
 import os
-from openai import OpenAI
-import subprocess
 
 from dotenv import load_dotenv, find_dotenv
 
 assert load_dotenv(find_dotenv('openai_api.env'))
 openai_api_key = os.getenv('OPENAI_API_KEY')
 
-from env import SERVER_IP, SERVER_PORT
+from env import SERVER_IP, SERVER_PORT, max_output_length
 
-# Function to run the command and return stdout and stderr
+
 def run_command(command, current_directory):
-    print(command.split())
+    print(f"Executing command in {current_directory}: {command.split()}")
+
+    start_time = time.time()
     process = subprocess.Popen(
         command.split(),
         stdout=subprocess.PIPE,
@@ -26,30 +26,38 @@ def run_command(command, current_directory):
         cwd=current_directory
     )
     
+    def read_output(pipe, output_list):
+        lines = 0
+        for line in iter(pipe.readline, ''):
+            if lines < max_output_length:
+                print(line.strip())
+                lines += 1
+            output_list.append(line.strip())
+        pipe.close()
 
-    def read_output(pipe):
-        while True:
-            output = pipe.readline()
-            if output:
-                print(output.strip())
-            else:
-                break
+    stdout_lines = []
+    stderr_lines = []
 
-        time.sleep(0.1)
+    stdout_thread = threading.Thread(target=read_output, args=(process.stdout, stdout_lines))
+    stderr_thread = threading.Thread(target=read_output, args=(process.stderr, stderr_lines))
 
-    stdout_reader = multiprocessing.Process(target=read_output, args=(process.stdout,))
-    stderr_reader = multiprocessing.Process(target=read_output, args=(process.stderr,))
-
-    stdout_reader.start()
-    stderr_reader.start()
+    stdout_thread.start()
+    stderr_thread.start()
 
     process.wait()
+    stdout_thread.join()
+    stderr_thread.join()
 
-    stdout_reader.join()
-    stderr_reader.join()
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f"Command executed in {execution_time:.2f} seconds.")
+
+    stdout = "\n".join(stdout_lines)
+    stderr = "\n".join(stderr_lines)
+
+    return stdout, stderr, execution_time
 
 
-# GPT interaction function
 def interact_with_gpt(chat_history):
     client = openai.OpenAI()
     response = client.chat.completions.create(
@@ -62,7 +70,7 @@ def interact_with_gpt(chat_history):
     chat_history.append({"role": "assistant", "content": gpt_response})
     return gpt_response.strip()
 
-# Handle Ctrl+C signal
+
 def handle_ctrl_c(signum, frame):
     print("Ctrl+C received, stopping execution.")
     raise KeyboardInterrupt
@@ -74,15 +82,15 @@ def handle_cd_command(directory):
     try:
         os.chdir(directory)
         print(f"Changed directory to {directory}")
+        return directory
     except FileNotFoundError:
         print(f"Directory '{directory}' does not exist.")
+        return os.getcwd()
 
-# Main function to handle incoming commands and GPT integration
+
 def handle_client_commands():
-
     current_directory = "/home/yw5343"
 
-    # Create a socket object
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((SERVER_IP, SERVER_PORT))
     server_socket.listen(1)
@@ -91,13 +99,12 @@ def handle_client_commands():
     client_socket, client_address = server_socket.accept()
     print(f"Connection from {client_address}")
 
-    # Initialize chat history with your system message
     sys_msg = """
     You are a fully autonomous agent (instead of an assistant) whose job is to evaluate the usability of a given Github repo. \
     You will be interacting with a persistent terminal through a rule-based interface that you chat with. \
     No human will be filling in blanks for you. You are in charge of the entire system via the shell. \
     The RULE-BASED interface will deliver inputs and outputs between you and the terminal (shell). \
-    > If there is an output from the terminal, the interface will provide the output with you. If there is no output, the interface will say 'no return'.
+    > If there is an output from the terminal, the interface will provide the output with you. If there is no output, the interface will say 'no return'. 
     Your goal is to evaluate how easy it is to use this repository with the help of the README/doc. Therefore, you must access the README/doc to know what you should do. \
     All your actions will be realized through the terminal. You need to provide commands to test the repository by yourself. \
     You have to provide ONLY ONE line of command to the user after each run. \
@@ -116,44 +123,51 @@ def handle_client_commands():
     Make system calls to fix any possible errors during running.
 
     Please note:
-    Always reply ONLY the command in your response WITHOUT any other expianation. Strictly no more than one at each time.
-    The current category is not saved. Each time when you want to change the direction, please include the full direction.
-    Sometimes the command will not lead to an output but can still finish executing the command. In that case, the output provided to you will also be empty.
-    If you think the testing is finished or you want to stop the process at any time, please put 'stop' for the command.
+    1. You will provide a chain of thought reasoning followed by a single command to interact with the system. Exactly one at each time.
+    Strictly follow the output format:
+    <Reasoning> ```
+    <Command>
+
+    Here is an example output:
+    To begin testing, I will clone the repository to our system.
+
+    ```bash
+    git clone https://github.com/example/repo.git
+
+    2. The current category is not saved. Each time when you want to change the direction, please include the full direction.
+    3. Sometimes the command will not lead to an output but can still finish executing the command. In that case, the output provided to you will also be empty.
+    4. If you think the testing is finished or you want to stop the process at any time, please put 'stop' for the command.
     """ 
     
-    chat_history = [{"role": "system", "content": sys_msg}]
 
-    # Receive the repo URL or command from client
+    chat_history = [{"role": "system", "content": sys_msg}]
     data = client_socket.recv(1024).decode('utf-8')
 
     if data == "STOP_PROCESS":
         print("Stop signal received from client.")
         client_socket.send("Stopping process.".encode('utf-8'))
         client_socket.close()
-        return  # Exit the function to stop further execution
+        return
 
-    # If it's not STOP_PROCESS, proceed with normal GPT interaction
     chat_history.append({"role": "user", "content": f"Here is a GitHub repo to test: {data}"})
 
-    # Chain of Thought (CoT) reasoning
-    chat_history.append({"role": "user", "content": "Explain your reasoning and steps before giving the command."})
-    chain_of_thought = interact_with_gpt(chat_history)
-    print(f"Chain of thought:\n{chain_of_thought}")
-
-    # GPT generates the first terminal command
-    gpt_command = interact_with_gpt(chat_history).replace("```bash", "").replace("```", "").strip()
-    print(f"GPT command:\n{gpt_command}")
-
     while True:
+        responses = interact_with_gpt(chat_history).replace("```bash", "").replace("```", "").strip()
+        response_parts = responses.split('\n')
+        chain_of_thought = "\n".join(response_parts[:-1]).strip()
+        gpt_command = response_parts[-1].strip()
+
+        print(f"Chain of Thought:\n{chain_of_thought}")
+        print(f"GPT command:\n{gpt_command}")
+
+        chat_history.append({"role": "assistant", "content": f"{chain_of_thought}\n\n{gpt_command}"})
+
         if "stop" in gpt_command.lower():
             print("Process finished by GPT.")
             break
-        
-        # change dir if the command is "cd"
+
         if gpt_command.startswith("cd"):
             target_directory = gpt_command.split()[1]
-            # handle_cd_command(target_directory)
             if not os.path.isabs(target_directory):
                 target_directory = os.path.join(current_directory, target_directory)
             try:
@@ -162,35 +176,31 @@ def handle_client_commands():
                 print(f"Changed directory to {current_directory}")
             except FileNotFoundError:
                 print(f"Directory '{target_directory}' does not exist.")
-            gpt_command = interact_with_gpt(chat_history).replace("```bash", "").replace("```", "").strip()
-            print(f"GPT command:\n{gpt_command}")
-            chat_history.append({"role": "user", "content": gpt_command})
             continue
 
-        # Run the command in a separate process
-        command_process = multiprocessing.Process(target=run_command, args=(gpt_command, current_directory))
-        command_process.start()
-        
-        # Wait for the command process to finish
-        command_process.join()
+        stdout, stderr, execution_time = run_command(gpt_command, current_directory)
 
-        # Send acknowledgment or result back to client
-        client_socket.send("Command executed".encode('utf-8'))
+        if stdout:
+            chat_history.append({"role": "user", "content": f"Standard Output:\n{stdout}"})
+        if stderr:
+            chat_history.append({"role": "user", "content": f"Standard Error:\n{stderr}"})
+        chat_history.append({"role": "user", "content": f"Command executed in {execution_time:.2f} seconds."})
 
-        chain_of_thought = interact_with_gpt(chat_history)
-        print(f"Chain of thought:\n{chain_of_thought}")
+        combined_output = (
+            f"Execution Time: {execution_time:.2f} seconds\n" +
+            stdout + ("\n" + stderr if stderr else "") or "no return"
+        )
 
-        gpt_command = interact_with_gpt(chat_history).replace("```bash", "").replace("```", "").strip()
-        print(f"GPT command:\n{gpt_command}")
-
-        chat_history.append({"role": "user", "content": gpt_command})
-
+        try:
+            client_socket.send(combined_output.encode('utf-8'))
+        except BrokenPipeError:
+            print("Client disconnected. Closing connection.")
+            break
 
     client_socket.close()
     server_socket.close()
 
+
 if __name__ == "__main__":
-    # Set up Ctrl+C handling
     signal.signal(signal.SIGINT, handle_ctrl_c)
-    
     handle_client_commands()
