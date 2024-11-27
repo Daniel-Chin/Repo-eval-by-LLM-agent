@@ -13,7 +13,7 @@ def runGitPullBlocking():
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 ... # notify LLM agent of (how much time passed, new stdout stderr)
-                # you can use `queue` or `yield`
+                # you can use `queue` or `yield` or callbacks
                 continue
         ... # notify LLM agent of (process finished, remaining stdout stderr)
     
