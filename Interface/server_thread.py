@@ -145,7 +145,7 @@ def handle_client_commands():
     Please note:
     1. You will provide a chain of thought reasoning followed by a single command to interact with the system. Exactly one at each time.
     Strictly follow the output format:
-    <Reasoning> ```
+    <Reasoning>
     <Command>
 
     Here is an example output:
@@ -153,7 +153,7 @@ def handle_client_commands():
 
     ```bash
     git clone https://github.com/example/repo.git
-
+    ```
     2. The current category is not saved. Each time when you want to change the direction, please include the full direction.
     3. Sometimes the command will not lead to an output but can still finish executing the command. In that case, the output provided to you will also be empty.
     4. If you think the testing is finished or you want to stop the process at any time, please put 'stop' for the command.
