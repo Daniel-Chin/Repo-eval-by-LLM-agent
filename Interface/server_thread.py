@@ -14,6 +14,13 @@ openai_api_key = os.getenv('OPENAI_API_KEY')
 
 from env import SERVER_IP, SERVER_PORT, max_output_length
 
+# Function to log conversation
+'''
+def log_conversation(entry):
+    with open("/mnt/shared/conversation_log.txt", "a") as log_file:
+        log_file.write(f"{entry}\n\n")
+'''
+
 # Function to run the command and provide updates
 def run_command_with_feedback(command, current_directory, status_queue):
     print(f"Executing command in {current_directory}: {command.split()}")
@@ -82,6 +89,10 @@ def interact_with_gpt(chat_history):
     )
     gpt_response = response.choices[0].message.content
     chat_history.append({"role": "assistant", "content": gpt_response})
+
+    # Log GPT response
+    # log_conversation(f"GPT Response:\n{gpt_response}")
+
     return gpt_response.strip()
 
 
@@ -119,12 +130,13 @@ def handle_client_commands():
     client_socket, client_address = server_socket.accept()
     print(f"Connection from {client_address}")
 
+    # > If there is an output from the terminal, the interface will provide the output with you. If there is no output, the interface will say 'no return'. 
     sys_msg = """
     You are a fully autonomous agent (instead of an assistant) whose job is to evaluate the usability of a given Github repo. \
     You will be interacting with a persistent terminal through a rule-based interface that you chat with. \
     No human will be filling in blanks for you. You are in charge of the entire system via the shell. \
     The RULE-BASED interface will deliver inputs and outputs between you and the terminal (shell). \
-    > If there is an output from the terminal, the interface will provide the output with you. If there is no output, the interface will say 'no return'. 
+    
     Your goal is to evaluate how easy it is to use this repository with the help of the README/doc. Therefore, you must access the README/doc to know what you should do. \
     All your actions will be realized through the terminal. You need to provide commands to test the repository by yourself. \
     You have to provide ONLY ONE line of command to the user after each run. \
@@ -145,7 +157,7 @@ def handle_client_commands():
     Please note:
     1. You will provide a chain of thought reasoning followed by a single command to interact with the system. Exactly one at each time.
     Strictly follow the output format:
-    <Reasoning>
+    <Reasoning> ```
     <Command>
 
     Here is an example output:
@@ -153,12 +165,13 @@ def handle_client_commands():
 
     ```bash
     git clone https://github.com/example/repo.git
-    ```
+
     2. The current category is not saved. Each time when you want to change the direction, please include the full direction.
     3. Sometimes the command will not lead to an output but can still finish executing the command. In that case, the output provided to you will also be empty.
     4. If you think the testing is finished or you want to stop the process at any time, please put 'stop' for the command.
     """ 
     chat_history = [{"role": "system", "content": sys_msg}]
+    # log_conversation(f"System Message:\n{sys_msg}")
     data = client_socket.recv(1024).decode('utf-8')
 
     if data == "STOP_PROCESS":
@@ -168,6 +181,7 @@ def handle_client_commands():
         return
 
     chat_history.append({"role": "user", "content": f"Here is a GitHub repo to test: {data}"})
+    # log_conversation(f"User Input:\nHere is a GitHub repo to test: {data}")
 
     while True:
         responses = interact_with_gpt(chat_history).replace("```bash", "").replace("```", "").strip()
@@ -177,6 +191,8 @@ def handle_client_commands():
 
         print(f"Chain of Thought:\n{chain_of_thought}")
         print(f"GPT command:\n{gpt_command}")
+
+        # log_conversation(f"Chain of Thought:\n{chain_of_thought}\nGPT Command:\n{gpt_command}")
 
         chat_history.append({"role": "assistant", "content": f"{chain_of_thought}\n\n{gpt_command}"})
 
@@ -204,10 +220,23 @@ def handle_client_commands():
                     print(f"STDOUT Preview:\n{status_update['stdout_preview']}")
                     print(f"STDERR Preview:\n{status_update['stderr_preview']}")
 
-                    decision = input("Do you want to terminate this process? (yes/no): ").strip().lower()
-                    if decision == "yes":
-                        print("Terminating process...")
+                    status_message = (
+                        f"Elapsed time: {status_update['elapsed_time']:.2f} seconds\n"
+                        f"STDOUT Preview:\n{status_update['stdout_preview']}\n"
+                        f"STDERR Preview:\n{status_update['stderr_preview']}"
+                        f"Do you want to terminate this process? (yes/no): "
+                    )
+
+                    chat_history.append({"role": "user", "content": status_message})
+
+                    if "yes" in gpt_response:
+                        print("Terminating process as instructed by GPT...")
+                        process.terminate()
                         break
+                    # decision = input("Do you want to terminate this process? (yes/no): ").strip().lower()
+                    # if decision == "yes":
+                    #     print("Terminating process...")
+                    #     break
                 elif status_update["status"] == "finished":
                     print(f"Command completed in {status_update['elapsed_time']:.2f} seconds.")
                     break
