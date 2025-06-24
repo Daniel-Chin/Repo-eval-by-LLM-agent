@@ -1,4 +1,6 @@
-import openai
+from openai import OpenAI
+
+client = OpenAI()
 import os
 from openai import OpenAI
 import subprocess
@@ -12,12 +14,10 @@ os.environ['OPENAI_API_KEY'] = "API_KEY_HERE"
 
 def get_completion(prompt, model = "gpt-3.5-turbo"):
     messages = [{"role": "user", "content": prompt}]
-    response = openai.ChatCompletion.create(
-        model = model,
-        messages = messages,
-        temperature = 0
-    )
-    return response.choices[0].message["content"]
+    response = client.chat.completions.create(model = model,
+    messages = messages,
+    temperature = 0)
+    return response.choices[0].message.content
 
 sys_msg = """
 You are a fully autonomous agent (instead of an assistant) whose job is to evaluate the usability of a given Github repo. \
