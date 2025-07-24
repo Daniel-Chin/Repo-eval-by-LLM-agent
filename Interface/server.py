@@ -146,12 +146,16 @@ Maintain a professional, exploratory tone, explicitly stating your reasoning and
 ### Operator Authority
 You have full control over a dedicated OS environment via a rule-based terminal interface. No human assistance will fill in blanks for you. You are responsible for configuring the system, debugging errors, and retuning the environment as needed.
 
-### Interaction
-- You will be provided with several functions to execute commands and manage processes within the terminal environment.  
-- The \'screen\' displays the current working directory, process status, and live output.
-- When calling a function, do not forgot to include your chain-of-thought in your response.
-- Execute **ONE** shell command per `run_shell_command` call.
-- Prioritize core CLI commands and features; deprioritize or skip features that require extensive GUI interaction or are clearly out of the intended testing scope.
+### Interaction Workflow (VERY IMPORTANT)
+You operate in a strict two-phase "Think, then Act" cycle.
+**Phase 1: THINK**
+- You will be shown the current screen.
+- Your ONLY available tool is `propose_next_action`.
+- You MUST call this function, providing your detailed `reasoning` and the `proposed_command` you want to run.
+**Phase 2: ACT**
+- After you propose an action, the system will confirm your plan.
+- You will then be given the actual execution tools (`run_shell_command`, `wait`, etc.).
+- You MUST then call the appropriate function to execute the command exactly as you proposed it.
 
 ### Important Tips
 - If `cd` fails with a relative path, retry with the absolute path.
@@ -185,6 +189,19 @@ Then calculate and report an **Overall Score** (1.0-5.0) along with a brief just
     WAIT_DEF = FunctionDefinition(name="wait", description="Pauses execution for a specified duration or a default period.", parameters={"type": "object", "properties": {"duration": {"type": "number", "description": "Optional. Seconds to wait."}}})
     KILL_COMMAND_DEF = FunctionDefinition(name="kill_current_command", description="Terminates the currently running shell command, if any.", parameters={"type": "object", "properties": {"pid": {"type": "integer", "description": "Optional. The Process ID (PID) to kill."}}})
     REPORT_FINDINGS_DEF = FunctionDefinition(name="report_test_findings_and_terminate", description="Submits your final analysis and star-ratings, then terminates the agent.", parameters={"type": "object", "properties": {"test_summary": {"type": "string", "description": "Overall summary."}, "errors_encountered": {"type": "string", "description": "Specific errors."}, "functionality_check": {"type": "string", "description": "Did primary functionality work?"}}, "required": ["test_summary", "errors_encountered", "functionality_check"]})
+    PROPOSE_ACTION_DEF = FunctionDefinition(
+        name="propose_next_action",
+        description="Propose the next shell command to execute based on your reasoning.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "reasoning": {"type": "string", "description": "Your detailed chain-of-thought and rationale for the proposed command."},
+                "proposed_command": {"type": "string", "description": "The exact shell command you propose to run next."}
+            },
+            "required": ["reasoning", "proposed_command"]
+        }
+    )
+
 
     def render(self) -> tp.Tuple[str, str, tp.List[tp.Tuple[FunctionDefinition, UIEventHandler]]]:
         screen_as_text = f"Time: {time.strftime('%H:%M:%S')} | Repo: {self.github_url_to_test} | CWD: {self.current_directory} | Cmd Status: {self.job_state.state}\n"
@@ -344,6 +361,8 @@ def save_interaction_log_file(screen_id: int, api_call_payloads: list):
 # ===============================================================
 # 5. Main LAI Loop
 # ===============================================================
+
+
 async def main_lai_loop(
     laiAsUI: GithubRepoTesterUI, client_openai: AsyncOpenAI,
     model_name: str = "gpt-4.1-mini", max_tokens: int = 4000, temperature: float = 0.05,
@@ -369,85 +388,104 @@ async def main_lai_loop(
         while not laiAsUI.program_should_terminate:
             current_screen_id = next(id_iter)
             api_call_logs_for_turn = []
-            raw_instructions, raw_screen_as_text, raw_available_funcs = laiAsUI.render()
+            
+            raw_instructions, raw_screen_as_text, available_funcs = laiAsUI.render()
             log_interaction_agent(f"\n--- Screen ID: {current_screen_id} ---\nInstructions: {raw_instructions}\nScreen Text:\n{raw_screen_as_text}\n--- End Screen ---", role="agent_ui_render")
 
-            # Summarization Step
-            summary = "Summary not generated or an error occurred."
+            current_lai_reply = LAIReply(id_=current_screen_id, instructions=raw_instructions, screen_as_text=raw_screen_as_text)
             
-            # MODIFIED: Build a special, complete screen text for the summarization step
-            screen_as_text_for_summary = raw_screen_as_text
-            if laiAsUI.job_state.is_state("command_finished") or laiAsUI.job_state.is_state("error"):
-                # Rebuild the screen text with the FULL untruncated output for the summarizer
-                base_info = f"Time: {time.strftime('%H:%M:%S')} | Repo: {laiAsUI.github_url_to_test} | CWD: {laiAsUI.current_directory} | Cmd Status: {laiAsUI.job_state.state}\n"
-                full_output = f"\n--- Last Command Result (Full Output) ---\n"
-                full_output += f"STDOUT:\n{laiAsUI.last_command_output.get('stdout', '')}\n"
-                full_output += f"STDERR:\n{laiAsUI.last_command_output.get('stderr', '')}\n"
-                full_output += f"Return Code: {laiAsUI.last_command_output.get('return_code')}\n"
-                full_output += "---------------------------\n"
-                screen_as_text_for_summary = base_info + full_output
-
-            to_summarize_reply = LAIReply(id_=current_screen_id, instructions="Review the screen. Summarize all new and important information for your future reference.", screen_as_text=screen_as_text_for_summary)
-            
+            # --- PHASE 1: THINK ---
+            reasoning = ""
+            proposed_command = ""
             try:
-                summary_messages_to_send = Messages(to_summarize_reply)
-                summary_completion = await client_openai.chat.completions.create(model=model_name, messages=summary_messages_to_send, tools=[{'type': 'function', 'function': tp.cast(FunctionDefinitionParam, SUMMARIZE_SCREEN_FUNCTION_DEF.model_dump(exclude_none=True))}], tool_choice={'type': 'function', 'function': {'name': SUMMARIZE_SCREEN_FUNCTION_DEF.name}}, max_tokens=500, temperature=0.0)
-                assistant_summary_message = summary_completion.choices[0].message
-                api_call_logs_for_turn.append({'messages_sent': summary_messages_to_send, 'gpt_reply': assistant_summary_message.model_dump()})
-                chat_history_for_llm.append(to_summarize_reply) 
-                chat_history_for_llm.append(assistant_summary_message)
-                if assistant_summary_message.tool_calls:
-                    tool_call = assistant_summary_message.tool_calls[0]; args = json.loads(tool_call.function.arguments); summary = args.get('summary', 'Summary was empty.')
-                    chat_history_for_llm.append({"tool_call_id": tool_call.id, "role": "tool", "content": summary})
-                else: summary = assistant_summary_message.content or "Summary call: no tool use or content."
-                log_interaction_agent(f"Screen Summary (ID: {current_screen_id}): {summary}", role="llm_summary")
-            except Exception as e: log_interaction_agent(f"Summarization API call failed: {e}", role="error")
-
-            # Action Step
-            lai_reply_for_action = LAIReply(id_=current_screen_id, instructions=raw_instructions, screen_as_text=raw_screen_as_text, screen_summary=summary)
-            tool_definitions_for_llm = [{'type': 'function', 'function': tp.cast(FunctionDefinitionParam, f[0].model_dump(exclude_none=True))} for f in raw_available_funcs]
-            min_wait_time = 5.0 
-
-            if not tool_definitions_for_llm and not laiAsUI.program_should_terminate: await asyncio.sleep(min_wait_time); continue
-
-            try:
-                action_messages_to_send = Messages(lai_reply_for_action)
-                action_completion = await client_openai.chat.completions.create(model=model_name, messages=action_messages_to_send, tools=tool_definitions_for_llm or None, tool_choice="auto" if tool_definitions_for_llm else None, max_tokens=max_tokens, temperature=temperature)
-                llm_action_message = action_completion.choices[0].message
-                api_call_logs_for_turn.append({'messages_sent': action_messages_to_send, 'gpt_reply': llm_action_message.model_dump()})
-                chat_history_for_llm.append(lai_reply_for_action) 
-                chat_history_for_llm.append(llm_action_message)
+                think_messages = Messages(current_lai_reply)
+                think_completion = await client_openai.chat.completions.create(
+                    model=model_name,
+                    messages=think_messages,
+                    tools=[{'type': 'function', 'function': tp.cast(FunctionDefinitionParam, laiAsUI.PROPOSE_ACTION_DEF.model_dump(exclude_none=True))}],
+                    tool_choice={'type': 'function', 'function': {'name': laiAsUI.PROPOSE_ACTION_DEF.name}},
+                )
+                assistant_think_message = think_completion.choices[0].message
+                api_call_logs_for_turn.append({'messages_sent': think_messages, 'gpt_reply': assistant_think_message.model_dump()})
                 
-                if llm_action_message.content: log_interaction_agent(f"LLM Chain of Thought: {llm_action_message.content}", role="llm_thought")
-                if llm_action_message.tool_calls:
-                    wait_times_from_handlers = []
-                    for tool_call in llm_action_message.tool_calls:
-                        function_name = tool_call.function.name
-                        handler = next((h for f, h in raw_available_funcs if f.name == function_name), None)
-                        if handler:
-                            try:
+                if assistant_think_message.tool_calls:
+                    tool_call = assistant_think_message.tool_calls[0]
+                    args = json.loads(tool_call.function.arguments)
+                    reasoning = args.get("reasoning", "")
+                    proposed_command = args.get("proposed_command", "")
+                    log_interaction_agent(f"LLM Chain of Thought: {reasoning}", role="llm_thought")
+                    log_interaction_agent(f"LLM Proposed Command: {proposed_command}", role="llm_plan")
+
+                    chat_history_for_llm.append(current_lai_reply)
+                    chat_history_for_llm.append(assistant_think_message)
+                    
+                    # MODIFIED: Add the required 'tool' message to acknowledge the 'propose_next_action' call
+                    chat_history_for_llm.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": laiAsUI.PROPOSE_ACTION_DEF.name,
+                        "content": "Plan acknowledged. Proceeding to the action phase."
+                    })
+                else:
+                    log_interaction_agent("LLM failed to propose an action.", role="error")
+                    await asyncio.sleep(5); continue
+
+            except Exception as e:
+                log_interaction_agent(f"Think API/processing error: {e}", role="error")
+                await asyncio.sleep(10); continue
+
+            # --- PHASE 2: ACT ---
+            min_wait_time = 1.0
+            if proposed_command:
+                try:
+                    act_lai_reply = LAIReply(
+                        id_=current_screen_id,
+                        instructions=f"Your plan is to run the command: `{proposed_command}`. Please execute this now using the available tools.",
+                        screen_as_text=raw_screen_as_text
+                    )
+                    
+                    action_messages = Messages(act_lai_reply)
+                    tool_definitions_for_llm = [{'type': 'function', 'function': tp.cast(FunctionDefinitionParam, f[0].model_dump(exclude_none=True))} for f in available_funcs]
+                    
+                    action_completion = await client_openai.chat.completions.create(
+                        model=model_name,
+                        messages=action_messages,
+                        tools=tool_definitions_for_llm,
+                        tool_choice="auto",
+                    )
+                    llm_action_message = action_completion.choices[0].message
+                    api_call_logs_for_turn.append({'messages_sent': action_messages, 'gpt_reply': llm_action_message.model_dump()})
+                    
+                    chat_history_for_llm.append(act_lai_reply)
+                    chat_history_for_llm.append(llm_action_message)
+
+                    if llm_action_message.tool_calls:
+                        for tool_call in llm_action_message.tool_calls:
+                            handler = next((h for f, h in available_funcs if f.name == tool_call.function.name), None)
+                            if handler:
                                 args = json.loads(tool_call.function.arguments or '{}')
                                 wait_time = await asyncio.to_thread(handler, **args)
-                                wait_times_from_handlers.append(wait_time)
+                                min_wait_time = max(min_wait_time, wait_time)
                                 chat_history_for_llm.append({"tool_call_id": tool_call.id, "role": "tool", "content": str(laiAsUI.last_action_outcome_for_tool_message)[:2000]})
-                            except Exception as he: log_interaction_agent(f"Handler error for {function_name}: {he}", role="error"); wait_times_from_handlers.append(1.0)
-                        else: log_interaction_agent(f"Unknown func: {function_name}", role="error"); wait_times_from_handlers.append(1.0)
-                    min_wait_time = min(wait_times_from_handlers) if wait_times_from_handlers else 5.0
-                else: log_interaction_agent(f"LLM no tool use: {llm_action_message.content or 'No content.'}", role="llm_action"); min_wait_time = 10.0
-            except Exception as e: log_interaction_agent(f"Action API/processing error: {e}", role="error"); min_wait_time = 10.0 
+                            else:
+                                log_interaction_agent(f"Unknown function called: {tool_call.function.name}", role="error")
+                    else:
+                        log_interaction_agent("LLM did not execute its proposed command.", role="error")
+
+                except Exception as e:
+                    log_interaction_agent(f"Act API/processing error: {e}", role="error")
             
             save_interaction_log_file(current_screen_id, api_call_logs_for_turn)
             log_interaction_agent(f"Loop end {current_screen_id}. Wait: {min_wait_time:.2f}s.", "system_internal")
+            
             await asyncio.sleep(max(0.1, min_wait_time))
-            max_hist = 50
-            if len(chat_history_for_llm) > max_hist:
-                chat_history_for_llm = chat_history_for_llm[-max_hist:]
-                if chat_history_for_llm and isinstance(chat_history_for_llm[0], dict) and chat_history_for_llm[0].get('role') == 'tool':
-                    log_interaction_agent("Correcting history: Removing orphaned tool message from the start of the context.", "system_internal")
-                    chat_history_for_llm = chat_history_for_llm[1:]
 
-    except asyncio.CancelledError: log_interaction_agent("LAI loop cancelled.", "system_internal")
-    finally: await laiAsUI.cleanup(); log_interaction_agent("LAI loop finished.", "system_internal")
+    except asyncio.CancelledError:
+        log_interaction_agent("LAI loop cancelled.", "system_internal")
+    finally:
+        await laiAsUI.cleanup()
+        log_interaction_agent("LAI loop finished.", "system_internal")
+
 
 # ===============================================================
 # 6. Entry Point
