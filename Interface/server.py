@@ -7,11 +7,12 @@ import os
 import json
 from queue import Queue, Empty
 from dotenv import load_dotenv, find_dotenv
+import xml.etree.ElementTree as ET
 
 # --- Type Hinting Imports ---
 import typing as tp
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from abc import ABCMeta, abstractmethod
 from functools import cached_property
 import itertools
@@ -41,6 +42,44 @@ if not os.getenv('OPENAI_API_KEY'):
 LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "agent_test_log.txt")
 INITIAL_WORKING_DIRECTORY = os.path.expanduser("~")
 DEFAULT_REPO_URL_TO_TEST: str = "https://github.com/pwaller/pyfiglet"
+
+
+# ===============================================================
+# 0. Process Management (NEW SECTION)
+# ===============================================================
+
+@dataclass
+class ManagedProcess:
+    pid: int
+    command: str
+    subprocess: subprocess.Popen
+    status: str = "running"
+    start_time: float = field(default_factory=time.time)
+    stdout_queue: Queue = field(default_factory=Queue)
+    stderr_queue: Queue = field(default_factory=Queue)
+    return_code: tp.Optional[int] = None
+    
+    # Fields to store the complete output permanently
+    full_stdout: str = ""
+    full_stderr: str = ""
+
+    def get_age(self) -> float:
+        return time.time() - self.start_time
+
+    def read_stdout(self) -> str:
+        lines = []
+        while not self.stdout_queue.empty():
+            try: lines.append(self.stdout_queue.get_nowait())
+            except Empty: break
+        return "".join(lines)
+
+    def read_stderr(self) -> str:
+        lines = []
+        while not self.stderr_queue.empty():
+            try: lines.append(self.stderr_queue.get_nowait())
+            except Empty: break
+        return "".join(lines)
+    
 
 # ===============================================================
 # 1. LAIAsUI Framework Base
@@ -87,7 +126,7 @@ class LAIAsUI(metaclass=ABCMeta):
         raise NotImplementedError()
 
     @abstractmethod
-    def render(self) -> tp.Tuple[str, str, tp.List[tp.Tuple[FunctionDefinition, UIEventHandler]]]:
+    def render(self) -> str:
         raise NotImplementedError()
 
     @abstractmethod
@@ -122,23 +161,24 @@ class GithubRepoTesterUI(LAIAsUI):
     def __init__(self, openai_client: AsyncOpenAI, initial_repo_url: tp.Optional[str] = None):
         self.client = openai_client
         self.current_directory: str = INITIAL_WORKING_DIRECTORY
-        self.job_state: JobStateMachine = JobStateMachine()
-        self.process_output_queue: Queue = Queue()
-        
-        self.current_subprocess: tp.Optional[subprocess.Popen] = None
-        self.subprocess_thread: tp.Optional[threading.Thread] = None
-        self.kill_event: threading.Event = threading.Event()
-
         self.github_url_to_test: str = initial_repo_url or DEFAULT_REPO_URL_TO_TEST
-        self.cloned_repo_name: str = self.github_url_to_test.split('/')[-1].replace('.git', '') if self.github_url_to_test else "repository"
-        
-        self.last_command_output: tp.Dict[str, tp.Any] = {"stdout": "", "stderr": "", "return_code": None, "elapsed_time": 0}
-        self.last_action_outcome_for_tool_message: tp.Optional[str] = None
         self.program_should_terminate: bool = False
+
+        self.processes: tp.Dict[int, ManagedProcess] = {}
+        self.summary_history: tp.List[str] = []
+        self._lock = threading.Lock()
+
+        self.current_stage: str = "Setup" # Start in the Setup stage
+        self.stage_prompts = {
+            "Setup": "Goal: Make the repository runnable. This may involve cloning, exploring files, or installing dependencies.",
+            "Exploration": "Goal: Understand the repository's features. This may involve reading the documentation or using help commands.",
+            "Testing": "Goal: Verify the core features work correctly by running one or more examples from the documentation. After verifying, move on to the next stage to report.",
+            "Reporting": "Goal: Summarize your findings and provide a final score by calling the report function."
+        }
         
         self.SYSTEM_PROMPT = f"""
 ### Your job
-You are a fully autonomous agent whose job is to test the usability of a given GitHub repository. Play the role of a user invoking the repo for the first time. After completing your evaluation, summarize your findings in a concise report.  
+You are a fully autonomous agent whose job is to test the usability of a given GitHub repository: {self.github_url_to_test}. Play the role of a user invoking the repo for the first time. After completing your evaluation, summarize your findings in a concise report.  
 Design and execute comprehensive test plans that exercise as many repository features as possible, acknowledging that some capabilities may lie outside your immediate testing scope.  
 Assess documentation clarity, verifying that examples are understandable and appropriately concise, and ensure that the repository\'s tone aligns with its intended functionality.  
 Maintain a professional, exploratory tone, explicitly stating your reasoning and observations.
@@ -146,16 +186,19 @@ Maintain a professional, exploratory tone, explicitly stating your reasoning and
 ### Operator Authority
 You have full control over a dedicated OS environment via a rule-based terminal interface. No human assistance will fill in blanks for you. You are responsible for configuring the system, debugging errors, and retuning the environment as needed.
 
-### Interaction Workflow (VERY IMPORTANT)
-You operate in a strict two-phase "Think, then Act" cycle.
-**Phase 1: THINK**
-- You will be shown the current screen.
-- Your ONLY available tool is `propose_next_action`.
-- You MUST call this function, providing your detailed `reasoning` and the `proposed_command` you want to run.
-**Phase 2: ACT**
-- After you propose an action, the system will confirm your plan.
-- You will then be given the actual execution tools (`run_shell_command`, `wait`, etc.).
-- You MUST then call the appropriate function to execute the command exactly as you proposed it.
+### Testing Workflow & Stages
+You MUST follow a structured testing process. In every "Think" phase, you must identify which of the following stages you are in.
+
+1.  **Setup:** Your initial goal. Clone the repo, explore the file system, and install all necessary dependencies (`pip install`, etc.). The goal is to prepare a runnable environment.
+2.  **Exploration:** After setup is complete. Read the README file and run the primary command with `--help` to understand the core functionality.
+3.  **Testing:** After you understand the tool. Execute one or two of the main examples or features described in the documentation to verify they work.
+4.  **Reporting:** Once you have gathered enough information, you MUST call the `report_test_findings_and_terminate` function. Do not use `echo` to create a report; you must call the function directly.
+
+### Interaction Cycle
+You operate in a strict three-phase cycle: **Think -> Act -> Summarize.**
+- **Think:** Based on the screen and your current stage, call `propose_next_action` with your `current_stage`, `reasoning`, and `proposed_command`.
+- **Act:** Execute the proposed command.
+- **Summarize:** Summarize the results of your action for your long-term memory.
 
 ### Important Tips
 - If `cd` fails with a relative path, retry with the absolute path.
@@ -185,153 +228,257 @@ Then calculate and report an **Overall Score** (1.0-5.0) along with a brief just
         return "\n".join(output_lines)
 
     # --- Tool/Function Definitions ---
-    RUN_SHELL_COMMAND_DEF = FunctionDefinition(name="run_shell_command", description="Executes a single shell command.", parameters={"type": "object", "properties": {"command": {"type": "string", "description": "The shell command to execute."}}, "required": ["command"]})
-    WAIT_DEF = FunctionDefinition(name="wait", description="Pauses execution for a specified duration or a default period.", parameters={"type": "object", "properties": {"duration": {"type": "number", "description": "Optional. Seconds to wait."}}})
-    KILL_COMMAND_DEF = FunctionDefinition(name="kill_current_command", description="Terminates the currently running shell command, if any.", parameters={"type": "object", "properties": {"pid": {"type": "integer", "description": "Optional. The Process ID (PID) to kill."}}})
-    REPORT_FINDINGS_DEF = FunctionDefinition(name="report_test_findings_and_terminate", description="Submits your final analysis and star-ratings, then terminates the agent.", parameters={"type": "object", "properties": {"test_summary": {"type": "string", "description": "Overall summary."}, "errors_encountered": {"type": "string", "description": "Specific errors."}, "functionality_check": {"type": "string", "description": "Did primary functionality work?"}}, "required": ["test_summary", "errors_encountered", "functionality_check"]})
-    PROPOSE_ACTION_DEF = FunctionDefinition(
-        name="propose_next_action",
-        description="Propose the next shell command to execute based on your reasoning.",
+    NEW_SHELL_COMMAND_DEF = FunctionDefinition(name="new_shell_command",description="Starts a new shell command in the background and returns its PID.",parameters={"type": "object","properties": {"command_str": {"type": "string", "description": "The shell command to execute."}},"required": ["command_str"],},)
+    WAIT_DEF = FunctionDefinition(name="wait",description="Pauses execution for a specified duration to allow processes to run.",parameters={"type": "object","properties": {"time_s": {"type": "number", "description": "Seconds to wait."}},"required": ["time_s"],},)
+    KILL_DEF = FunctionDefinition(name="kill",description="Terminates a specific running process by its PID.",parameters={"type": "object","properties": {"pid": {"type": "integer", "description": "The PID of the process to terminate."}},"required": ["pid"],},)
+    SUMMARIZE_SCREEN_FUNCTION_DEF = FunctionDefinition(name='summarizeScreen',description=("Carefully review the current XML screen. Create a concise yet comprehensive summary of all new and important information, events, outputs, and errors from the <processes> block."),parameters={'type': 'object','properties': {'summary': {'type': 'string', 'description': 'Your comprehensive summary of the latest events.'}},'required': ['summary'],},)
+    PROPOSE_ACTION_DEF = FunctionDefinition(name="propose_next_action",description="Propose the next shell command to execute based on your reasoning.",
         parameters={
             "type": "object",
             "properties": {
-                "reasoning": {"type": "string", "description": "Your detailed chain-of-thought and rationale for the proposed command."},
-                "proposed_command": {"type": "string", "description": "The exact shell command you propose to run next."}
+                "current_stage": {
+                    "type": "string",
+                    "description": "The current stage of your testing process.",
+                    "enum": ["Setup", "Exploration", "Testing", "Reporting"]
+                },
+                "reasoning": {"type": "string", "description": "Your detailed chain-of-thought and rationale for the proposed command, based on the past summaries and current screen."},
+                "proposed_command": {"type": "string", "description": "The exact shell command you propose to run next (e.g., 'ls -l', 'cd repo', 'python3 setup.py')."}
             },
             "required": ["reasoning", "proposed_command"]
         }
     )
+    REPORT_FINDINGS_DEF = FunctionDefinition(
+        name="report_test_findings_and_terminate",
+        description="Submits your final analysis and star-ratings, then terminates the agent.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "setup_ease_score": {"type": "number", "description": "Rating (1.0-5.0) for setup ease."},
+                "execution_difficulty_score": {"type": "number", "description": "Rating (1.0-5.0) for execution difficulty."},
+                "doc_quality_score": {"type": "number", "description": "Rating (1.0-5.0) for documentation quality."},
+                "overall_score": {"type": "number", "description": "Final overall usability rating (1.0-5.0)."},
+                "justification": {"type": "string", "description": "Concise justification for your scores and summary."}
+            },
+            "required": ["setup_ease_score", "execution_difficulty_score", "doc_quality_score", "overall_score", "justification"],
+        }
+    )
 
-
-    def render(self) -> tp.Tuple[str, str, tp.List[tp.Tuple[FunctionDefinition, UIEventHandler]]]:
-        screen_as_text = f"Time: {time.strftime('%H:%M:%S')} | Repo: {self.github_url_to_test} | CWD: {self.current_directory} | Cmd Status: {self.job_state.state}\n"
+    def get_available_functions(self) -> tp.List[tp.Tuple[FunctionDefinition, UIEventHandler]]:
+        """Returns a list of all available tools and their handlers."""
         
-        if self.job_state.is_state("command_finished") or self.job_state.is_state("error"):
-            screen_as_text += f"\n--- Last Command Result ---\n"
-            MAX_OUTPUT_LEN_SCREEN = 2000 
-            stdout_display = self.last_command_output.get('stdout', '')
-            stderr_display = self.last_command_output.get('stderr', '')
-            if len(stdout_display) > MAX_OUTPUT_LEN_SCREEN: stdout_display = stdout_display[:MAX_OUTPUT_LEN_SCREEN] + "\n... (stdout truncated) ..."
-            if len(stderr_display) > MAX_OUTPUT_LEN_SCREEN: stderr_display = stderr_display[:MAX_OUTPUT_LEN_SCREEN] + "\n... (stderr truncated) ..."
-            screen_as_text += f"STDOUT:\n{stdout_display}\n"
-            screen_as_text += f"STDERR:\n{stderr_display}\n"
-            screen_as_text += f"Return Code: {self.last_command_output.get('return_code')}\n"
-            screen_as_text += "---------------------------\n"
-
-        if self.job_state.is_state("running_command"):
-            live_output = self._read_process_output_queue()
-            screen_as_text += f"--- Live Output ---\n{live_output or 'Awaiting output...'}\n-------------------\n"
+        # NOTE: In this new architecture, all tools are considered available at all times.
+        # The LLM is expected to use its reasoning to decide if a command like 'kill' is
+        # appropriate based on the process states it sees on the screen.
         
-        instructions = "Review screen. Decide next action towards testing the repository."
-        if self.program_should_terminate:
-            instructions = "Termination initiated."
-            return instructions, screen_as_text, []
-
-        available_functions: tp.List[tp.Tuple[FunctionDefinition, UIEventHandler]] = [
-            (self.RUN_SHELL_COMMAND_DEF, self.handle_run_shell_command),
+        return [
+            (self.NEW_SHELL_COMMAND_DEF, self.handle_new_shell_command),
             (self.WAIT_DEF, self.handle_wait),
-            (self.REPORT_FINDINGS_DEF, self.handle_report_test_findings)
+            (self.KILL_DEF, self.handle_kill),
+            (self.REPORT_FINDINGS_DEF, self.handle_report_test_findings),
         ]
-        if self.job_state.is_state("running_command"):
-            available_functions.append((self.KILL_COMMAND_DEF, self.handle_kill_current_command))
-        
-        return instructions, screen_as_text, available_functions
 
-    # --- Handler Method Implementations ---
-    def _command_execution_thread(self, command: str):
-        self.kill_event.clear()
-        start_time = time.time()
-        self.last_command_output = {"stdout": "", "stderr": "", "return_code": None, "elapsed_time": 0}
-        full_stdout_lines, full_stderr_lines = [], []
-        while not self.process_output_queue.empty():
-            try: self.process_output_queue.get_nowait()
-            except Empty: break
+    def render(self) -> str:
+        """Generates an XML-based screen for the LLM. Does not delete processes."""
+        with self._lock:
+            root = ET.Element("screen")
+            state_elem = ET.SubElement(root, "current_state")
+            ET.SubElement(state_elem, "working_directory").text = self.current_directory
+            prompt_text = self.stage_prompts.get(self.current_stage, "Review processes and decide the next action.")
+            ET.SubElement(state_elem, "prompt", attrib={"stage": self.current_stage}).text = prompt_text
+            processes_elem = ET.SubElement(root, "processes")
 
+            for pid, proc in self.processes.items():
+                proc_elem = ET.SubElement(processes_elem, "process", attrib={"pid": str(pid)})
+                ET.SubElement(proc_elem, "command").text = proc.command
+                ET.SubElement(proc_elem, "status").text = proc.status
+                ET.SubElement(proc_elem, "age_seconds").text = f"{proc.get_age():.1f}"
+                ET.SubElement(proc_elem, "return_code").text = str(proc.return_code) if proc.return_code is not None else "N/A"
+
+                stdout_text = proc.read_stdout() if proc.status == "running" else proc.full_stdout
+                stderr_text = proc.read_stderr() if proc.status == "running" else proc.full_stderr
+
+                ET.SubElement(proc_elem, "stdout").text = stdout_text
+                ET.SubElement(proc_elem, "stderr").text = stderr_text
+
+            ET.indent(root, space="\t")
+            return ET.tostring(root, encoding='unicode')
+    
+    def render_as_graph(self, xml_string: str) -> str:
+        """Parses the screen XML and renders it as a human-readable text graph with full output."""
         try:
-            self.current_subprocess = subprocess.Popen(['/bin/bash', '-c', command], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=self.current_directory, universal_newlines=True, bufsize=1)
-            def stream_reader(pipe, source_name, line_list):
-                if pipe:
-                    for line in iter(pipe.readline, ''):
-                        if self.kill_event.is_set(): break
-                        self.process_output_queue.put({"source": source_name, "line": line.strip()})
-                        line_list.append(line.strip())
-                    pipe.close()
+            root = ET.fromstring(xml_string)
+            lines = []
+
+            # --- Current Prompt Section ---
+            prompt = root.find(".//prompt")
+            stage = prompt.get("stage")
+            lines.append("-------------------------- (screen) -----------------------")
+            lines.append(f"| Stage: {stage}")
+            lines.append(f"| Prompt: {prompt.text}")
+            lines.append("|--------------------------------------------------------")
+
+            # --- Current Processes Section ---
+            lines.append("|------------------- current processes --------------------")
             
-            stdout_thread = threading.Thread(target=stream_reader, args=(self.current_subprocess.stdout, "stdout", full_stdout_lines))
-            stderr_thread = threading.Thread(target=stream_reader, args=(self.current_subprocess.stderr, "stderr", full_stderr_lines))
-            stdout_thread.start(); stderr_thread.start()
+            for proc_elem in root.findall(".//process"):
+                pid = proc_elem.get("pid")
+                command = proc_elem.find("command").text or ""
+                status = proc_elem.find("status").text or ""
+                age = float(proc_elem.find("age_seconds").text or 0)
+                return_code = proc_elem.find("return_code").text or "N/A"
+                
+                cmd_display = (command[:60] + '...') if len(command) > 63 else command
+                
+                # Print the main process info line
+                lines.append(f"| PID: {pid:<5} | Status: {status:<10} | Age: {age:<7.1f}s | Code: {return_code:<3} |")
+                lines.append(f"| Command: {cmd_display}")
+
+                # Get the full stdout and stderr
+                stdout = proc_elem.find("stdout").text or ""
+                stderr = proc_elem.find("stderr").text or ""
+
+                # If there is stdout, format and add it.
+                if stdout.strip():
+                    lines.append("|--[stdout]--------------------------------------------")
+                    for line in stdout.strip().split('\n'):
+                        lines.append(f"|  > {line}")
+
+                # If there is stderr, format and add it.
+                if stderr.strip():
+                    lines.append("|--[stderr]--------------------------------------------")
+                    for line in stderr.strip().split('\n'):
+                        lines.append(f"|  > {line}")
+                lines.append("|--------------------------------------------------------")
             
-            stdout_thread.join(); stderr_thread.join()
-            self.current_subprocess.wait()
+            return "\n".join(lines)
+        except ET.ParseError as e:
+            return f"Error parsing XML for graph rendering: {e}\n\n{xml_string}"
+    
+    # --- Tool/Function Definitions & Handlers ---
 
-            if self.kill_event.is_set():
-                self.last_command_output["return_code"] = -1; full_stderr_lines.append("Process terminated by kill signal.")
-            else: self.last_command_output["return_code"] = self.current_subprocess.returncode
-        except Exception as e:
-            full_stderr_lines.append(f"System error executing command: {e}"); self.last_command_output["return_code"] = -2
-        finally:
-            self.last_command_output["stdout"] = "\n".join(full_stdout_lines)
-            self.last_command_output["stderr"] = "\n".join(full_stderr_lines)
-            self.last_command_output["elapsed_time"] = time.time() - start_time
-            self.job_state.set_state("command_finished" if self.last_command_output["return_code"] == 0 else "error")
-            self.current_subprocess = None
-
-    def handle_run_shell_command(self, command: str) -> float:
-        log_interaction_agent(f"[ACTION] Run Shell Command: {command}")
-        self.last_command_output = {}
-
-        if self.job_state.is_state("running_command"):
-            self.last_action_outcome_for_tool_message = "Error: Another command is already running."
-            return 1.0
-
-        if command.strip().startswith("cd "):
-            parts = command.strip().split(" ", 1); target_dir = parts[1] if len(parts) > 1 else "~"; original_dir = self.current_directory
-            try:
-                effective_target = os.path.join(self.current_directory, target_dir) if not target_dir.startswith(('/', '~')) else os.path.expanduser(target_dir)
-                os.chdir(os.path.normpath(effective_target)); self.current_directory = os.getcwd(); self.job_state.set_state("command_finished")
-                self.last_action_outcome_for_tool_message = f"Command '{command}' succeeded. CWD is now {self.current_directory}."
-                self.last_command_output = {"stdout": f"Changed directory to {self.current_directory}", "stderr": "", "return_code": 0}
-            except Exception as e:
-                self.current_directory = original_dir; self.job_state.set_state("error")
-                self.last_action_outcome_for_tool_message = f"Command '{command}' failed: {e}"
-                self.last_command_output = {"stdout": "", "stderr": str(e), "return_code": 1}
-            return 0.1
+    def _command_execution_thread(self, command: str):
+        # Initialize lists to collect the full output
+        full_stdout_lines, full_stderr_lines = [], []
         
-        self.job_state.set_state("running_command")
-        self.subprocess_thread = threading.Thread(target=self._command_execution_thread, args=(command,)); self.subprocess_thread.daemon = True; self.subprocess_thread.start(); self.subprocess_thread.join()
-        rc = self.last_command_output.get('return_code', 'N/A'); out = self.last_command_output.get('stdout', '')[:500]; err = self.last_command_output.get('stderr', '')[:500]
-        self.last_action_outcome_for_tool_message = f"Command finished with RC={rc}. Stdout: '{out}...', Stderr: '{err}...'"
-        return 1.0
+        try:
+            process = subprocess.Popen(
+                ['/bin/bash', '-c', command],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, cwd=self.current_directory, universal_newlines=True, bufsize=1
+            )
+            
+            with self._lock:
+                managed_proc = ManagedProcess(pid=process.pid, command=command, subprocess=process)
+                self.processes[process.pid] = managed_proc
 
-    def handle_wait(self, duration: tp.Optional[float] = None) -> float:
-        actual_duration = duration if duration is not None and duration > 0 else 3.0
-        log_interaction_agent(f"[ACTION] Wait ({actual_duration:.1f}s)"); self.last_action_outcome_for_tool_message = f"Waited for {actual_duration:.1f}s."
-        return actual_duration
+            # The stream_reader now correctly takes 'line_list' to store full output
+            def stream_reader(pipe: tp.IO[str], queue: Queue, line_list: tp.List[str]):
+                for line in iter(pipe.readline, ''):
+                    queue.put(line)      # For live reading
+                    line_list.append(line) # For permanent storage
+                pipe.close()
 
-    def handle_kill_current_command(self, pid: tp.Optional[int] = None) -> float:
-        log_interaction_agent(f"[ACTION] Kill Current Command (targeting PID: {pid or 'any active'})")
-        if self.job_state.is_state("running_command") and self.current_subprocess:
-            self.kill_event.set(); self.last_action_outcome_for_tool_message = f"Kill signal sent to running command."
-        else: self.last_action_outcome_for_tool_message = "No command was running to kill."
-        return 1.0
+            # The threading.Thread calls now correctly pass 'line_list' as the third argument
+            stdout_thread = threading.Thread(target=stream_reader, args=(process.stdout, managed_proc.stdout_queue, full_stdout_lines))
+            stderr_thread = threading.Thread(target=stream_reader, args=(process.stderr, managed_proc.stderr_queue, full_stderr_lines))
+            stdout_thread.start()
+            stderr_thread.start()
+            
+            process.wait()
+            stdout_thread.join()
+            stderr_thread.join()
 
-    def handle_report_test_findings(self, test_summary: str, errors_encountered: str, functionality_check: str) -> float:
-        final_report = f"=== GitHub Repo Test Report ===\nRepo: {self.github_url_to_test}\nSummary: {test_summary}\nErrors: {errors_encountered}\nCheck: {functionality_check}\n================================"
+            with self._lock:
+                # Save the collected full output to the process object
+                managed_proc.full_stdout = "".join(full_stdout_lines)
+                managed_proc.full_stderr = "".join(full_stderr_lines)
+                managed_proc.return_code = process.returncode
+                managed_proc.status = "finished" if process.returncode == 0 else "error"
+        except Exception as e:
+            print(f"Failed to start command '{command}': {e}")
+
+    NEW_SHELL_COMMAND_DEF = FunctionDefinition(name="new_shell_command", description="Starts a new shell command in the background.", parameters={"type": "object", "properties": {"command_str": {"type": "string", "description": "The shell command to execute."}}, "required": ["command_str"]})
+    def handle_new_shell_command(self, command_str: str) -> str:
+        if command_str.strip().startswith("cd "):
+            try:
+                target_dir = command_str.strip().split(" ", 1)[1]
+                effective_target = os.path.join(self.current_directory, target_dir) if not target_dir.startswith(('/', '~')) else os.path.expanduser(target_dir)
+                os.chdir(os.path.normpath(effective_target))
+                self.current_directory = os.getcwd()
+                return f"Changed directory to {self.current_directory}."
+            except Exception as e:
+                return f"Error changing directory: {e}"
+
+        thread = threading.Thread(target=self._command_execution_thread, args=(command_str,))
+        thread.daemon = True
+        thread.start()
+        time.sleep(0.1) # Give a moment for the thread to start and create the process
+        with self._lock:
+            latest_proc = max(self.processes.values(), key=lambda p: p.start_time, default=None)
+            if latest_proc and latest_proc.command == command_str and latest_proc.status == "running":
+                return f"Command initiated with PID: {latest_proc.pid}"
+        return "Command initiated, but PID could not be immediately determined."
+
+    WAIT_DEF = FunctionDefinition(name="wait", description="Pauses execution for a specified duration.", parameters={"type": "object", "properties": {"time_s": {"type": "number", "description": "Seconds to wait."}}, "required": ["time_s"]})
+    def handle_wait(self, time_s: float) -> str:
+        actual_wait = max(0, min(time_s, 300))
+        time.sleep(actual_wait)
+        return f"Waited for {actual_wait:.1f} seconds."
+
+    KILL_DEF = FunctionDefinition(name="kill", description="Terminates a specific running process by its PID.", parameters={"type": "object", "properties": {"pid": {"type": "integer", "description": "The PID of the process to terminate."}}, "required": ["pid"]})
+    def handle_kill(self, pid: int) -> str:
+        with self._lock:
+            if pid in self.processes and self.processes[pid].status == "running":
+                try:
+                    self.processes[pid].subprocess.terminate()
+                    return f"Sent termination signal to process with PID {pid}."
+                except Exception as e:
+                    return f"Error terminating process {pid}: {e}"
+            else:
+                return f"No running process with PID {pid} found."
+
+    def handle_report_test_findings(self, setup_ease_score: float, execution_difficulty_score: float, doc_quality_score: float, overall_score: float, justification: str) -> str:
+        final_report = f"""
+================================
+=== GitHub Repo Test Report ===
+================================
+Repository: {self.github_url_to_test}
+
+--- SCORING ---
+- Environment Setup Ease:     {setup_ease_score:.1f} / 5.0
+- Execution Difficulty:       {execution_difficulty_score:.1f} / 5.0
+- Documentation Quality:      {doc_quality_score:.1f} / 5.0
+---------------------------------
+- Overall Score:              {overall_score:.1f} / 5.0
+
+--- JUSTIFICATION & SUMMARY ---
+{justification}
+================================
+        """
         print(final_report)
-        log_interaction_agent(f"[ACTION] Test Report Submitted:\n{final_report}")
-        self.program_should_terminate = True; self.job_state.set_state("terminated")
-        self.last_action_outcome_for_tool_message = "Test findings reported; program will terminate."
-        return 0.1
-
+        self.program_should_terminate = True
+        return "Test findings reported. Program will terminate."
+    
     async def cleanup(self):
         print("[CLEANUP] Cleanup called.")
-        if self.current_subprocess and self.current_subprocess.poll() is None:
-            print("[CLEANUP] Active subprocess found. Signaling kill_event.")
-            self.kill_event.set()
-            if self.subprocess_thread and self.subprocess_thread.is_alive():
-                self.subprocess_thread.join(timeout=2.0)
-            if self.current_subprocess and self.current_subprocess.poll() is None:
-                print("[CLEANUP] Forcing kill on subprocess."); self.current_subprocess.kill()
+        with self._lock:
+            # MODIFIED: Iterate through the new processes dictionary
+            for pid, proc in self.processes.items():
+                if proc.status == "running":
+                    print(f"[CLEANUP] Terminating active process {pid}.")
+                    try:
+                        # Use the stored subprocess object to kill the process
+                        proc.subprocess.kill()
+                    except Exception as e:
+                        print(f"[CLEANUP] Error killing process {pid}: {e}")
+    
+    def cull_finished_processes(self):
+        """Removes any processes that have finished from the list."""
+        with self._lock:
+            pids_to_delete = [pid for pid, proc in self.processes.items() if proc.status in ["finished", "error"]]
+            for pid in pids_to_delete:
+                if pid in self.processes:
+                    del self.processes[pid]
 
 # ===============================================================
 # 4. Logging
@@ -362,129 +509,110 @@ def save_interaction_log_file(screen_id: int, api_call_payloads: list):
 # 5. Main LAI Loop
 # ===============================================================
 
+async def main_lai_loop(laiAsUI: GithubRepoTesterUI, client_openai: AsyncOpenAI, model_name: str = "gpt-4.1-mini"):
+    # This chat_history is the persistent, long-term memory built from summaries.
+    chat_history: tp.List[ChatCompletionMessageParam] = []
 
-async def main_lai_loop(
-    laiAsUI: GithubRepoTesterUI, client_openai: AsyncOpenAI,
-    model_name: str = "gpt-4.1-mini", max_tokens: int = 4000, temperature: float = 0.05,
-):
-    chat_history_for_llm: tp.List[tp.Union[LAIReply, ChatCompletionMessage, ChatCompletionMessageParam]] = []
-    id_iter = itertools.count(0)
+    while not laiAsUI.program_should_terminate:
+        
+        # --- Phase 1: RENDER and THINK ---
+        print("\n--- AGENT STATE ---")
+        # Step 1: Render the current state, including any finished processes from the last turn.
+        screen_xml = laiAsUI.render()
+        print(laiAsUI.render_as_graph(screen_xml))
 
-    def Messages(last_lai_reply: LAIReply) -> tp.List[ChatCompletionMessageParam]:
-        processed_messages: tp.List[ChatCompletionMessageParam] = [{'role': 'system', 'content': laiAsUI.systemPrinciples()}]
-        for msg in chat_history_for_llm:
-            if isinstance(msg, LAIReply): processed_messages.append({'role': 'user', 'content': msg.for_agent})
-            elif isinstance(msg, ChatCompletionMessage): 
-                assistant_msg: ChatCompletionMessageParam = {'role': msg.role, 'content': msg.content}
-                if msg.tool_calls: assistant_msg['tool_calls'] = [{'id': tc.id, 'type': tc.type, 'function': {'name': tc.function.name, 'arguments': tc.function.arguments}} for tc in msg.tool_calls]
-                if assistant_msg['content'] is None and not assistant_msg.get('tool_calls'): assistant_msg['content'] = "" 
-                elif assistant_msg.get('content') == "" and assistant_msg.get('tool_calls'): assistant_msg['content'] = None
-                processed_messages.append(assistant_msg)
-            elif isinstance(msg, dict) and msg.get('role') == 'tool': processed_messages.append(msg)
-        processed_messages.append({'role': 'user', 'content': last_lai_reply.for_agent})
-        return processed_messages
+        # Step 2: The agent "thinks" based on the screen it just saw.
+        past_summaries = "\n".join(laiAsUI.summary_history) or "No summaries yet."
+        think_prompt_content = f"<past_summaries>\n{past_summaries}\n</past_summaries>\n\n{screen_xml}"
+        
+        think_messages: tp.List[ChatCompletionMessageParam] = [
+            {'role': 'system', 'content': laiAsUI.systemPrinciples()},
+            *chat_history,
+            {'role': 'user', 'content': think_prompt_content}
+        ]
 
-    try:
-        while not laiAsUI.program_should_terminate:
-            current_screen_id = next(id_iter)
-            api_call_logs_for_turn = []
-            
-            raw_instructions, raw_screen_as_text, available_funcs = laiAsUI.render()
-            log_interaction_agent(f"\n--- Screen ID: {current_screen_id} ---\nInstructions: {raw_instructions}\nScreen Text:\n{raw_screen_as_text}\n--- End Screen ---", role="agent_ui_render")
+        api_call_logs_for_turn = []
+        
+        try:
+            # The agent can now choose between proposing a command or reporting findings.
+            think_tools = [
+                {'type': 'function', 'function': tp.cast(FunctionDefinitionParam, laiAsUI.PROPOSE_ACTION_DEF.model_dump(exclude_none=True))},
+                {'type': 'function', 'function': tp.cast(FunctionDefinitionParam, laiAsUI.REPORT_FINDINGS_DEF.model_dump(exclude_none=True))}
+            ]
+            think_completion = await client_openai.chat.completions.create(
+                model=model_name, 
+                messages=think_messages, 
+                tools=think_tools,
+                tool_choice='auto'
+            )
+            think_response = think_completion.choices[0].message
+            api_call_logs_for_turn.append({'messages_sent': think_messages, 'gpt_reply': think_response.model_dump()})
 
-            current_lai_reply = LAIReply(id_=current_screen_id, instructions=raw_instructions, screen_as_text=raw_screen_as_text)
-            
-            # --- PHASE 1: THINK ---
-            reasoning = ""
-            proposed_command = ""
-            try:
-                think_messages = Messages(current_lai_reply)
-                think_completion = await client_openai.chat.completions.create(
-                    model=model_name,
-                    messages=think_messages,
-                    tools=[{'type': 'function', 'function': tp.cast(FunctionDefinitionParam, laiAsUI.PROPOSE_ACTION_DEF.model_dump(exclude_none=True))}],
-                    tool_choice={'type': 'function', 'function': {'name': laiAsUI.PROPOSE_ACTION_DEF.name}},
-                )
-                assistant_think_message = think_completion.choices[0].message
-                api_call_logs_for_turn.append({'messages_sent': think_messages, 'gpt_reply': assistant_think_message.model_dump()})
-                
-                if assistant_think_message.tool_calls:
-                    tool_call = assistant_think_message.tool_calls[0]
-                    args = json.loads(tool_call.function.arguments)
+            # Step 3: Now that the agent has seen the finished process and thought, we can clear it.
+            # This is the key to the "show once" logic.
+            laiAsUI.cull_finished_processes()
+
+            proposed_command = "" 
+            if think_response.tool_calls:
+                tool_call = think_response.tool_calls[0]
+                function_name = tool_call.function.name
+                args = json.loads(tool_call.function.arguments)
+
+                if function_name == laiAsUI.PROPOSE_ACTION_DEF.name:
+                    current_stage = args.get("current_stage", "Unknown")
                     reasoning = args.get("reasoning", "")
                     proposed_command = args.get("proposed_command", "")
-                    log_interaction_agent(f"LLM Chain of Thought: {reasoning}", role="llm_thought")
-                    log_interaction_agent(f"LLM Proposed Command: {proposed_command}", role="llm_plan")
-
-                    chat_history_for_llm.append(current_lai_reply)
-                    chat_history_for_llm.append(assistant_think_message)
                     
-                    # MODIFIED: Add the required 'tool' message to acknowledge the 'propose_next_action' call
-                    chat_history_for_llm.append({
-                        "tool_call_id": tool_call.id,
-                        "role": "tool",
-                        "name": laiAsUI.PROPOSE_ACTION_DEF.name,
-                        "content": "Plan acknowledged. Proceeding to the action phase."
-                    })
-                else:
-                    log_interaction_agent("LLM failed to propose an action.", role="error")
-                    await asyncio.sleep(5); continue
+                    laiAsUI.current_stage = current_stage
+                    print(f"LLM STAGE: {current_stage}")
+                    print(f"LLM THOUGHT: {reasoning}")
 
-            except Exception as e:
-                log_interaction_agent(f"Think API/processing error: {e}", role="error")
-                await asyncio.sleep(10); continue
+                elif function_name == laiAsUI.REPORT_FINDINGS_DEF.name:
+                    print("LLM is reporting final findings and will terminate.")
+                    laiAsUI.handle_report_test_findings(**args)
+                    break # This correctly exits the loop.
 
-            # --- PHASE 2: ACT ---
-            min_wait_time = 1.0
+            # --- Phase 2: EXECUTE ---
             if proposed_command:
-                try:
-                    act_lai_reply = LAIReply(
-                        id_=current_screen_id,
-                        instructions=f"Your plan is to run the command: `{proposed_command}`. Please execute this now using the available tools.",
-                        screen_as_text=raw_screen_as_text
-                    )
-                    
-                    action_messages = Messages(act_lai_reply)
-                    tool_definitions_for_llm = [{'type': 'function', 'function': tp.cast(FunctionDefinitionParam, f[0].model_dump(exclude_none=True))} for f in available_funcs]
-                    
-                    action_completion = await client_openai.chat.completions.create(
-                        model=model_name,
-                        messages=action_messages,
-                        tools=tool_definitions_for_llm,
-                        tool_choice="auto",
-                    )
-                    llm_action_message = action_completion.choices[0].message
-                    api_call_logs_for_turn.append({'messages_sent': action_messages, 'gpt_reply': llm_action_message.model_dump()})
-                    
-                    chat_history_for_llm.append(act_lai_reply)
-                    chat_history_for_llm.append(llm_action_message)
+                print(f"EXECUTING: {proposed_command}")
+                laiAsUI.handle_new_shell_command(proposed_command)
+                await asyncio.sleep(0.5)
 
-                    if llm_action_message.tool_calls:
-                        for tool_call in llm_action_message.tool_calls:
-                            handler = next((h for f, h in available_funcs if f.name == tool_call.function.name), None)
-                            if handler:
-                                args = json.loads(tool_call.function.arguments or '{}')
-                                wait_time = await asyncio.to_thread(handler, **args)
-                                min_wait_time = max(min_wait_time, wait_time)
-                                chat_history_for_llm.append({"tool_call_id": tool_call.id, "role": "tool", "content": str(laiAsUI.last_action_outcome_for_tool_message)[:2000]})
-                            else:
-                                log_interaction_agent(f"Unknown function called: {tool_call.function.name}", role="error")
-                    else:
-                        log_interaction_agent("LLM did not execute its proposed command.", role="error")
-
-                except Exception as e:
-                    log_interaction_agent(f"Act API/processing error: {e}", role="error")
+            # --- Phase 3: SUMMARIZE ---
+            final_screen_xml = laiAsUI.render() # Render again to get final state for summary
+            summary_prompt_content = f"The turn is complete. Here is the final screen state. Summarize the key events and outcomes of your last action.\n{final_screen_xml}"
+            summary_messages: tp.List[ChatCompletionMessageParam] = [{'role': 'system', 'content': laiAsUI.systemPrinciples()}, *chat_history, {'role': 'user', 'content': summary_prompt_content}]
             
-            save_interaction_log_file(current_screen_id, api_call_logs_for_turn)
-            log_interaction_agent(f"Loop end {current_screen_id}. Wait: {min_wait_time:.2f}s.", "system_internal")
-            
-            await asyncio.sleep(max(0.1, min_wait_time))
+            summarize_tools = [{'type': 'function', 'function': tp.cast(FunctionDefinitionParam, laiAsUI.SUMMARIZE_SCREEN_FUNCTION_DEF.model_dump(exclude_none=True))}]
+            summary_completion = await client_openai.chat.completions.create(
+                model=model_name, messages=summary_messages, tools=summarize_tools,
+                tool_choice={'type': 'function', 'function': {'name': laiAsUI.SUMMARIZE_SCREEN_FUNCTION_DEF.name}}
+            )
+            summary_response = summary_completion.choices[0].message
+            api_call_logs_for_turn.append({'messages_sent': summary_messages, 'gpt_reply': summary_response.model_dump()})
 
-    except asyncio.CancelledError:
-        log_interaction_agent("LAI loop cancelled.", "system_internal")
-    finally:
-        await laiAsUI.cleanup()
-        log_interaction_agent("LAI loop finished.", "system_internal")
+            if summary_response.tool_calls:
+                # ... (rest of summary logic is the same)
+                tool_call = summary_response.tool_calls[0]
+                args = json.loads(tool_call.function.arguments)
+                summary = args.get("summary", "No summary provided.")
+                turn_summary_text = f"Summary of Turn {len(laiAsUI.summary_history)}: {summary}"
+                laiAsUI.summary_history.append(turn_summary_text)
+                print(f"SCREEN SUMMARY: {summary}")
+                
+                # Update chat history for context in the next turn
+                if think_response.tool_calls:
+                    chat_history.append({'role': 'assistant', 'content': think_response.tool_calls[0].function.arguments})
+                chat_history.append({'role': 'user', 'content': summary})
+
+
+        except Exception as e:
+            print(f"An error occurred in the main loop: {e}")
+            traceback.print_exc()
+            await asyncio.sleep(10)
+        
+        save_interaction_log_file(len(laiAsUI.summary_history), api_call_logs_for_turn)
+        
 
 
 # ===============================================================
