@@ -41,7 +41,8 @@ if not os.getenv('OPENAI_API_KEY'):
 # --- Constants ---
 LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "agent_test_log.txt")
 INITIAL_WORKING_DIRECTORY = os.path.expanduser("~")
-DEFAULT_REPO_URL_TO_TEST: str = "https://github.com/pwaller/pyfiglet"
+DEFAULT_REPO_URL_TO_TEST: str = "https://github.com/cookiecutter/cookiecutter"
+# DEFAULT_REPO_URL_TO_TEST: str = "https://github.com/pwaller/pyfiglet"
 
 
 # ===============================================================
@@ -201,6 +202,7 @@ You operate in a strict three-phase cycle: **Think -> Act -> Summarize.**
 - **Summarize:** Summarize the results of your action for your long-term memory.
 
 ### Important Tips
+- **ONE COMMAND PER TURN**: Propose only one single command per run. Do not propose something like `<command 1> && <command 2>`.
 - If `cd` fails with a relative path, retry with the absolute path.
 - Never use interactive browsers or TUIs (e.g., nano, vim); interact only via text-based commands.
 - Allow sufficient time for lengthy operations if they continuously produce new output.
@@ -208,11 +210,11 @@ You operate in a strict three-phase cycle: **Think -> Act -> Summarize.**
 - Use python3 for python commands.
 
 ### Evaluation and Scoring
-Whether succeeded or not, after your testing process, assign star-ratings (1.0-5.0) for each of these criteria:
+Whether succeeded or not, after your testing process, assign star-ratings (0.0-10.0) for each of these criteria:
 - **Environment Setup Ease**: how simple it is to configure and install dependencies.
 - **Execution Difficulty**: how straightforward it is to run the core functionality.
 - **Documentation Quality**: clarity, completeness, and usefulness of the README and examples.
-Then calculate and report an **Overall Score** (1.0-5.0) along with a brief justification for each rating.
+Then calculate and report an **Overall Score** (0.0-10.0) along with a brief justification for each rating.
 """.strip()
 
     def systemPrinciples(self) -> str:
@@ -253,10 +255,10 @@ Then calculate and report an **Overall Score** (1.0-5.0) along with a brief just
         parameters={
             "type": "object",
             "properties": {
-                "setup_ease_score": {"type": "number", "description": "Rating (1.0-5.0) for setup ease."},
-                "execution_difficulty_score": {"type": "number", "description": "Rating (1.0-5.0) for execution difficulty."},
-                "doc_quality_score": {"type": "number", "description": "Rating (1.0-5.0) for documentation quality."},
-                "overall_score": {"type": "number", "description": "Final overall usability rating (1.0-5.0)."},
+                "setup_ease_score": {"type": "number", "description": "Rating (0.0-10.0) for setup ease."},
+                "execution_difficulty_score": {"type": "number", "description": "Rating (0.0-10.0) for execution difficulty."},
+                "doc_quality_score": {"type": "number", "description": "Rating (0.0-10.0) for documentation quality."},
+                "overall_score": {"type": "number", "description": "Final overall usability rating (0.0-10.0)."},
                 "justification": {"type": "string", "description": "Concise justification for your scores and summary."}
             },
             "required": ["setup_ease_score", "execution_difficulty_score", "doc_quality_score", "overall_score", "justification"],
@@ -399,6 +401,7 @@ Then calculate and report an **Overall Score** (1.0-5.0) along with a brief just
 
     NEW_SHELL_COMMAND_DEF = FunctionDefinition(name="new_shell_command", description="Starts a new shell command in the background.", parameters={"type": "object", "properties": {"command_str": {"type": "string", "description": "The shell command to execute."}}, "required": ["command_str"]})
     def handle_new_shell_command(self, command_str: str) -> str:
+        # Handle simple cd commands only
         if command_str.strip().startswith("cd "):
             try:
                 target_dir = command_str.strip().split(" ", 1)[1]
@@ -409,18 +412,26 @@ Then calculate and report an **Overall Score** (1.0-5.0) along with a brief just
             except Exception as e:
                 return f"Error changing directory: {e}"
 
+        # Handle all other commands as background processes
         thread = threading.Thread(target=self._command_execution_thread, args=(command_str,))
         thread.daemon = True
         thread.start()
-        time.sleep(0.1) # Give a moment for the thread to start and create the process
-        with self._lock:
-            latest_proc = max(self.processes.values(), key=lambda p: p.start_time, default=None)
-            if latest_proc and latest_proc.command == command_str and latest_proc.status == "running":
-                return f"Command initiated with PID: {latest_proc.pid}"
-        return "Command initiated, but PID could not be immediately determined."
+        
+        # Wait for the process to actually start and be registered
+        max_attempts = 20  # 2 seconds total
+        for attempt in range(max_attempts):
+            time.sleep(0.1)
+            with self._lock:
+                # Look for a process that matches our command and is running
+                for proc in self.processes.values():
+                    if proc.command == command_str and proc.status == "running":
+                        return f"Command initiated with PID: {proc.pid}"
+        
+        # If we get here, the process didn't start as expected
+        return f"Command '{command_str}' was initiated but process status unclear."
 
     WAIT_DEF = FunctionDefinition(name="wait", description="Pauses execution for a specified duration.", parameters={"type": "object", "properties": {"time_s": {"type": "number", "description": "Seconds to wait."}}, "required": ["time_s"]})
-    def handle_wait(self, time_s: float) -> str:
+    def handle_wait(self, time_s: float = 3.0) -> str:  # Add default parameter
         actual_wait = max(0, min(time_s, 300))
         time.sleep(actual_wait)
         return f"Waited for {actual_wait:.1f} seconds."
@@ -445,11 +456,11 @@ Then calculate and report an **Overall Score** (1.0-5.0) along with a brief just
 Repository: {self.github_url_to_test}
 
 --- SCORING ---
-- Environment Setup Ease:     {setup_ease_score:.1f} / 5.0
-- Execution Difficulty:       {execution_difficulty_score:.1f} / 5.0
-- Documentation Quality:      {doc_quality_score:.1f} / 5.0
+- Environment Setup Ease:     {setup_ease_score:.1f} / 10.0
+- Execution Difficulty:       {execution_difficulty_score:.1f} / 10.0
+- Documentation Quality:      {doc_quality_score:.1f} / 10.0
 ---------------------------------
-- Overall Score:              {overall_score:.1f} / 5.0
+- Overall Score:              {overall_score:.1f} / 10.0
 
 --- JUSTIFICATION & SUMMARY ---
 {justification}
@@ -543,7 +554,8 @@ async def main_lai_loop(laiAsUI: GithubRepoTesterUI, client_openai: AsyncOpenAI,
                 model=model_name, 
                 messages=think_messages, 
                 tools=think_tools,
-                tool_choice='auto'
+                tool_choice='auto',
+                temperature=0.8
             )
             think_response = think_completion.choices[0].message
             api_call_logs_for_turn.append({'messages_sent': think_messages, 'gpt_reply': think_response.model_dump()})
@@ -575,8 +587,14 @@ async def main_lai_loop(laiAsUI: GithubRepoTesterUI, client_openai: AsyncOpenAI,
             # --- Phase 2: EXECUTE ---
             if proposed_command:
                 print(f"EXECUTING: {proposed_command}")
-                laiAsUI.handle_new_shell_command(proposed_command)
-                await asyncio.sleep(0.5)
+                result_message = laiAsUI.handle_new_shell_command(proposed_command)
+                print(f"COMMAND RESULT: {result_message}")
+                
+                # Give more time for processes to produce output, especially for npm install
+                if "npm install" in proposed_command:
+                    await asyncio.sleep(5.0)  # npm install needs more time to show progress
+                else:
+                    await asyncio.sleep(1.5)  # General commands
 
             # --- Phase 3: SUMMARIZE ---
             final_screen_xml = laiAsUI.render() # Render again to get final state for summary
