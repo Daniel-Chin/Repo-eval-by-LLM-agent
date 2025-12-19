@@ -41,12 +41,14 @@ if not os.getenv('OPENAI_API_KEY'):
 # --- Constants ---
 LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "agent_test_log.txt")
 INITIAL_WORKING_DIRECTORY = os.path.expanduser("~")
-DEFAULT_REPO_URL_TO_TEST: str = "https://github.com/cookiecutter/cookiecutter"
+# DEFAULT_REPO_URL_TO_TEST: str = "https://github.com/Kikyo-16/coco-mulla-repo"
+DEFAULT_REPO_URL_TO_TEST: str = "https://github.com/ZZWaang/audio2midi"
 # DEFAULT_REPO_URL_TO_TEST: str = "https://github.com/pwaller/pyfiglet"
+TAKEAWAYS_FILE_PATH = os.path.join(os.path.dirname(__file__), "takeaways.txt")
 
 
 # ===============================================================
-# 0. Process Management (NEW SECTION)
+# 0. Process Management
 # ===============================================================
 
 @dataclass
@@ -63,6 +65,8 @@ class ManagedProcess:
     # Fields to store the complete output permanently
     full_stdout: str = ""
     full_stderr: str = ""
+
+    finished_time: tp.Optional[float] = None
 
     def get_age(self) -> float:
         return time.time() - self.start_time
@@ -164,23 +168,36 @@ class GithubRepoTesterUI(LAIAsUI):
         self.current_directory: str = INITIAL_WORKING_DIRECTORY
         self.github_url_to_test: str = initial_repo_url or DEFAULT_REPO_URL_TO_TEST
         self.program_should_terminate: bool = False
-
         self.processes: tp.Dict[int, ManagedProcess] = {}
         self.summary_history: tp.List[str] = []
         self._lock = threading.Lock()
+        self.interrogation_pause_event = asyncio.Event()
 
-        self.current_stage: str = "Setup" # Start in the Setup stage
+        self.current_stage: str = "Setup"
         self.stage_prompts = {
             "Setup": "Goal: Make the repository runnable. This may involve cloning, exploring files, or installing dependencies.",
             "Exploration": "Goal: Understand the repository's features. This may involve reading the documentation or using help commands.",
-            "Testing": "Goal: Verify the core features work correctly by running one or more examples from the documentation. After verifying, move on to the next stage to report.",
-            "Reporting": "Goal: Summarize your findings and provide a final score by calling the report function."
+            "Testing": "Goal: Verify the core features work correctly by running one or more examples from the documentation.",
+            "Reporting": "Goal: Summarize your findings, formulate a key takeaway, and provide a final score by calling the report function."
         }
+
+        # --- NEW: Logic to load and format takeaways ---
+        takeaways_section = ""
+        try:
+            if os.path.exists(TAKEAWAYS_FILE_PATH):
+                with open(TAKEAWAYS_FILE_PATH, "r", encoding="utf-8") as f:
+                    takeaways = [line.strip() for line in f if line.strip()]
+                if takeaways:
+                    formatted_takeaways = "\n".join(f"- {t}" for t in takeaways)
+                    takeaways_section = f"### Previous Takeaways To Consider\n{formatted_takeaways}\n"
+        except Exception as e:
+            print(f"Warning: Could not load takeaways file: {e}")
         
         self.SYSTEM_PROMPT = f"""
+{takeaways_section}
 ### Your job
 You are a fully autonomous agent whose job is to test the usability of a given GitHub repository: {self.github_url_to_test}. Play the role of a user invoking the repo for the first time. After completing your evaluation, summarize your findings in a concise report.  
-Design and execute comprehensive test plans that exercise as many repository features as possible, acknowledging that some capabilities may lie outside your immediate testing scope.  
+Design and execute comprehensive test plans that exercise as many repository features as possible, focusing only on features that are realistically testable through text-based interaction. Many repositories may include non-text assets (videos, audio, images, large binaries, datasets, etc.) which are out of scope; in such cases, explicitly mark them as out of scope and continue testing text-based functionality to the largest extent possible. If you cannot test any, at least read its code and see if the functions seem to work with each other, or if there is any obvious mistake.
 Assess documentation clarity, verifying that examples are understandable and appropriately concise, and ensure that the repository\'s tone aligns with its intended functionality.  
 Maintain a professional, exploratory tone, explicitly stating your reasoning and observations.
 
@@ -188,9 +205,9 @@ Maintain a professional, exploratory tone, explicitly stating your reasoning and
 You have full control over a dedicated OS environment via a rule-based terminal interface. No human assistance will fill in blanks for you. You are responsible for configuring the system, debugging errors, and retuning the environment as needed.
 
 ### Testing Workflow & Stages
-You MUST follow a structured testing process. In every "Think" phase, you must identify which of the following stages you are in.
+You MUST STRICTLY follow a structured testing process as below. In every "Think" phase, you must identify which of the following stages you are in.
 
-1.  **Setup:** Your initial goal. Clone the repo, explore the file system, and install all necessary dependencies (`pip install`, etc.). The goal is to prepare a runnable environment.
+1.  **Setup:** Your initial goal. Clone the repo, explore the file system, and install all necessary dependencies (`pip install`, `sudo -n apt-get`, etc, even cloning and building from source). Allow long running time for installation. The goal is to prepare a runnable environment. Try to solve the environment errors you meet by yourself.
 2.  **Exploration:** After setup is complete. Read the README file and run the primary command with `--help` to understand the core functionality.
 3.  **Testing:** After you understand the tool. Execute one or two of the main examples or features described in the documentation to verify they work.
 4.  **Reporting:** Once you have gathered enough information, you MUST call the `report_test_findings_and_terminate` function. Do not use `echo` to create a report; you must call the function directly.
@@ -208,14 +225,17 @@ You operate in a strict three-phase cycle: **Think -> Act -> Summarize.**
 - Allow sufficient time for lengthy operations if they continuously produce new output.
 - You are fully responsible for resolving any errors you encounter. Set up the environment and prepare all necessary materials yourself. Never give up until you have tried your best to debug.
 - Use python3 for python commands.
+- If you already notified something that is related to a function which is out of your testing scope while setting up, you can choose to skip that specific part.
+- All running processes will be printed on the screen. If you find a running process disappears, see that process as finished.
 
 ### Evaluation and Scoring
-Whether succeeded or not, after your testing process, assign star-ratings (0.0-10.0) for each of these criteria:
-- **Environment Setup Ease**: how simple it is to configure and install dependencies.
-- **Execution Difficulty**: how straightforward it is to run the core functionality.
-- **Documentation Quality**: clarity, completeness, and usefulness of the README and examples.
-Then calculate and report an **Overall Score** (0.0-10.0) along with a brief justification for each rating.
-""".strip()
+At the end of your testing process, assign star-ratings (0.0â€“10.0) for each of the following criteria.
+**Important**: Each score must be evaluated independently. A problem in one area should not automatically reduce ratings in other areas. Always distinguish whether difficulties arise from the repository itself or from your own system environment to avoid unfair grading.
+- **Environment Setup Ease**: How easy it is to configure the environment and install dependencies. Consider whether errors are caused by the repoâ€™s instructions or by external/system issues. If it is caused by external/system issues, you should not lower the score of this field.
+- **Execution Difficulty**: How smoothly the programs or scripts run once setup is complete. Evaluate whether the code achieves its intended functions. If certain features require out-of-scope resources (e.g., videos, audio, large binaries, GUIs), ignore those and grade only the text-based parts you could test. This should only focus on whether the functions provided by the repository are running properly.
+- **Documentation Quality**: Clarity, completeness, and usefulness of the README and examples. Focus on whether it provides clear setup steps and runnable test/execution instructions.
+Finally, calculate and report an Overall Score (0.0â€“10.0) with a concise justification for each criterion.
+"""
 
     def systemPrinciples(self) -> str:
         return self.SYSTEM_PROMPT
@@ -251,7 +271,7 @@ Then calculate and report an **Overall Score** (0.0-10.0) along with a brief jus
     )
     REPORT_FINDINGS_DEF = FunctionDefinition(
         name="report_test_findings_and_terminate",
-        description="Submits your final analysis and star-ratings, then terminates the agent.",
+        description="Submits your final analysis, star-ratings, and a key takeaway, then terminates the agent.",
         parameters={
             "type": "object",
             "properties": {
@@ -259,11 +279,24 @@ Then calculate and report an **Overall Score** (0.0-10.0) along with a brief jus
                 "execution_difficulty_score": {"type": "number", "description": "Rating (0.0-10.0) for execution difficulty."},
                 "doc_quality_score": {"type": "number", "description": "Rating (0.0-10.0) for documentation quality."},
                 "overall_score": {"type": "number", "description": "Final overall usability rating (0.0-10.0)."},
-                "justification": {"type": "string", "description": "Concise justification for your scores and summary."}
+                "justification": {"type": "string", "description": "Concise justification for your scores and summary."},
+                "key_takeaway": {"type": "string", "description": "A single, concise strategic lesson for your future runs on similar repositories, not a reflection or suggestion on the repository you are testing."}
             },
-            "required": ["setup_ease_score", "execution_difficulty_score", "doc_quality_score", "overall_score", "justification"],
+            "required": ["setup_ease_score", "execution_difficulty_score", "doc_quality_score", "overall_score", "justification", "key_takeaway"],
         }
     )
+
+# Set Up Ease
+# how easy it is to get set up the environment for this repo
+# whether the errors are easy to solve
+# if you got an error because of your device but not the repo itself, do not score lower because of that
+#  
+# Execution Difficulty
+# whether the programs can run smoothly
+# whether the code can realize its functions
+#  
+# Readme Quality
+# whether the readme provides clear set up instruction and test/execution instruction 
 
     def get_available_functions(self) -> tp.List[tp.Tuple[FunctionDefinition, UIEventHandler]]:
         """Returns a list of all available tools and their handlers."""
@@ -396,6 +429,7 @@ Then calculate and report an **Overall Score** (0.0-10.0) along with a brief jus
                 managed_proc.full_stderr = "".join(full_stderr_lines)
                 managed_proc.return_code = process.returncode
                 managed_proc.status = "finished" if process.returncode == 0 else "error"
+                managed_proc.finished_time = time.time()
         except Exception as e:
             print(f"Failed to start command '{command}': {e}")
 
@@ -448,7 +482,7 @@ Then calculate and report an **Overall Score** (0.0-10.0) along with a brief jus
             else:
                 return f"No running process with PID {pid} found."
 
-    def handle_report_test_findings(self, setup_ease_score: float, execution_difficulty_score: float, doc_quality_score: float, overall_score: float, justification: str) -> str:
+    def handle_report_test_findings(self, setup_ease_score: float, execution_difficulty_score: float, doc_quality_score: float, overall_score: float, justification: str, key_takeaway: str) -> str:
         final_report = f"""
 ================================
 === GitHub Repo Test Report ===
@@ -464,11 +498,21 @@ Repository: {self.github_url_to_test}
 
 --- JUSTIFICATION & SUMMARY ---
 {justification}
+
+--- KEY TAKEAWAY ---
+{key_takeaway}
 ================================
         """
         print(final_report)
+
+        try:
+            with open(TAKEAWAYS_FILE_PATH, "a", encoding="utf-8") as f:
+                f.write(key_takeaway + "\n")
+        except Exception as e:
+            print(f"Error saving takeaway: {e}")
+
         self.program_should_terminate = True
-        return "Test findings reported. Program will terminate."
+        return "Test findings and takeaway reported. Program will terminate."
     
     async def cleanup(self):
         print("[CLEANUP] Cleanup called.")
@@ -483,13 +527,92 @@ Repository: {self.github_url_to_test}
                     except Exception as e:
                         print(f"[CLEANUP] Error killing process {pid}: {e}")
     
-    def cull_finished_processes(self):
-        """Removes any processes that have finished from the list."""
+    def cull_finished_processes(self, grace_seconds: float = 2.0):
+        """Removes processes that have finished, but only after a small grace period
+        to ensure the agent had time to observe the 'finished' state."""
+        now = time.time()
         with self._lock:
-            pids_to_delete = [pid for pid, proc in self.processes.items() if proc.status in ["finished", "error"]]
+            pids_to_delete = []
+            for pid, proc in self.processes.items():
+                if proc.status in ["finished", "error"]:
+                    # if finished_time is missing, be conservative â€” keep it for one more loop
+                    if proc.finished_time is None:
+                        continue
+                    if (now - proc.finished_time) >= grace_seconds:
+                        pids_to_delete.append(pid)
             for pid in pids_to_delete:
                 if pid in self.processes:
                     del self.processes[pid]
+
+    
+    async def handle_interrogation(self, last_screen: str, last_action: dict, chat_history: tp.List[ChatCompletionMessageParam]):
+        """Pauses the agent for a multi-turn conversation and gets responses from the agent."""
+        print("\n--- AGENT PAUSED: CONVERSATION MODE ---")
+        print("Type your questions below. Type 'end', 'resume', or 'exit' to continue the agent's task.")
+        
+        # This history is temporary and only for this conversation
+        interrogation_history: tp.List[ChatCompletionMessageParam] = []
+
+        # --- MODIFICATION: Create the initial context message only once ---
+        initial_context = (
+            f"A human operator has paused you to ask clarifying questions about your last action.\n\n"
+            f"--- LAST SCREEN YOU SAW ---\n{last_screen}\n\n"
+            f"--- YOUR LAST PROPOSED ACTION ---\n{json.dumps(last_action, indent=2)}\n\n"
+        )
+        interrogation_history.append({'role': 'user', 'content': initial_context})
+
+        try:
+            while True:
+                question = await asyncio.to_thread(input, "\nYour question ('end' to resume): ")
+
+                if question.strip().lower() in ["end", "resume", "exit"]:
+                    break
+                if not question.strip():
+                    continue
+
+                # --- MODIFICATION: Append the new question to the existing history ---
+                interrogation_history.append({'role': 'user', 'content': question})
+
+                # --- MODIFICATION: Always include the full interrogation history ---
+                messages: tp.List[ChatCompletionMessageParam] = [
+                    {'role': 'system', 'content': self.systemPrinciples()},
+                    *chat_history,
+                    *interrogation_history
+                ]
+
+                print("\nðŸ¤” Agent is thinking...")
+                response = await self.client.chat.completions.create(
+                    model="gpt-4-turbo",
+                    messages=messages,
+                )
+                answer = response.choices[0].message.content
+                print(f"\n AGENT RESPONSE:\n{answer}")
+
+                # Add the agent's answer to the temporary history for conversational context
+                if answer:
+                    interrogation_history.append({'role': 'assistant', 'content': answer})
+
+        except Exception as e:
+            print(f"An error occurred during interrogation: {e}")
+        finally:
+            print("\n--- AGENT RESUMING ---")
+            self.interrogation_pause_event.clear() # Unpause the main loop
+
+
+# --- Listen for user input ---
+def input_listener_thread(ui_instance: GithubRepoTesterUI, loop: asyncio.AbstractEventLoop):
+    """Listens for the 'i' or 'interrogate' command to pause the agent."""
+    while not ui_instance.program_should_terminate:
+        try:
+            command = input()
+            if command.strip().lower() in ["i", "interrogate"]:
+                # Use call_soon_threadsafe to set the async event from this sync thread
+                loop.call_soon_threadsafe(ui_instance.interrogation_pause_event.set)
+        except (EOFError, KeyboardInterrupt):
+            # Handle Ctrl+C or end of input gracefully
+            break
+        time.sleep(0.1)
+
 
 # ===============================================================
 # 4. Logging
@@ -520,12 +643,20 @@ def save_interaction_log_file(screen_id: int, api_call_payloads: list):
 # 5. Main LAI Loop
 # ===============================================================
 
-async def main_lai_loop(laiAsUI: GithubRepoTesterUI, client_openai: AsyncOpenAI, model_name: str = "gpt-4.1-mini"):
+async def main_lai_loop(laiAsUI: GithubRepoTesterUI, client_openai: AsyncOpenAI, model_name: str = "gpt-5-mini"):
     # This chat_history is the persistent, long-term memory built from summaries.
     chat_history: tp.List[ChatCompletionMessageParam] = []
+    last_screen_xml = ""
+    last_think_response = {}
 
     while not laiAsUI.program_should_terminate:
         
+        # --- Check for pause event at the start of the loop ---
+        if laiAsUI.interrogation_pause_event.is_set():
+            await laiAsUI.handle_interrogation(last_screen_xml, last_think_response, chat_history)
+            continue # Skip the rest of the loop and start the next turn
+
+
         # --- Phase 1: RENDER and THINK ---
         print("\n--- AGENT STATE ---")
         # Step 1: Render the current state, including any finished processes from the last turn.
@@ -554,14 +685,12 @@ async def main_lai_loop(laiAsUI: GithubRepoTesterUI, client_openai: AsyncOpenAI,
                 model=model_name, 
                 messages=think_messages, 
                 tools=think_tools,
-                tool_choice='auto',
-                temperature=0.8
+                tool_choice='auto'
             )
             think_response = think_completion.choices[0].message
             api_call_logs_for_turn.append({'messages_sent': think_messages, 'gpt_reply': think_response.model_dump()})
 
             # Step 3: Now that the agent has seen the finished process and thought, we can clear it.
-            # This is the key to the "show once" logic.
             laiAsUI.cull_finished_processes()
 
             proposed_command = "" 
@@ -637,20 +766,33 @@ async def main_lai_loop(laiAsUI: GithubRepoTesterUI, client_openai: AsyncOpenAI,
 # 6. Entry Point
 # ===============================================================
 if __name__ == "__main__":
-    # ... (__main__ block remains the same as the last version) ...
+
     ui_instance = GithubRepoTesterUI(client, initial_repo_url=DEFAULT_REPO_URL_TO_TEST)
     loop = asyncio.get_event_loop()
     main_task = None
+
     def signal_handler_sigint(signum, frame): 
         print("\nCtrl+C: Shutdown...")
         log_interaction_agent("Ctrl+C shutdown.", "signal_event")
         if main_task and not main_task.done(): main_task.cancel()
+
     signal.signal(signal.SIGINT, signal_handler_sigint)
+
+    # --- Start the input listener thread ---
+    listener_thread = threading.Thread(target=input_listener_thread, args=(ui_instance, loop), daemon=True)
+    listener_thread.start()
+    print("Agent is running. Press 'i' or 'interrogate' then Enter to pause and ask a question.")
+    
     try:
         main_task = loop.create_task(main_lai_loop(ui_instance, client))
         loop.run_until_complete(main_task)
-    except asyncio.CancelledError: log_interaction_agent("Main task cancelled.", "system_event")
+    except asyncio.CancelledError: 
+        log_interaction_agent("Main task cancelled.", "system_event")
     except Exception as e:
-        log_interaction_agent(f"UNHANDLED EXCEPTION: {e}", "critical_error"); log_interaction_agent(traceback.format_exc(), "critical_error_trace")
+        log_interaction_agent(f"UNHANDLED EXCEPTION: {e}", "critical_error")
+        log_interaction_agent(traceback.format_exc(), "critical_error_trace")
     finally:
-        print("Final log save."); save_interaction_log_file(-1, []); print("Exited.")
+        ui_instance.program_should_terminate = True # Ensure listener thread exits
+        print("Final log save.")
+        save_interaction_log_file(-1, [])
+        print("Exited.")
