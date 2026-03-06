@@ -15,6 +15,7 @@ from abc import ABCMeta, abstractmethod
 import traceback
 from enum import Enum, auto
 import re
+import copy
 
 # Import OpenAI Pydantic models for Function Calling
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
@@ -36,8 +37,8 @@ if not os.getenv('OPENAI_API_KEY'):
 # --- Constants ---
 LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "agent_test_log.txt")
 INITIAL_WORKING_DIRECTORY = os.path.expanduser("~")
-# DEFAULT_REPO_URL_TO_TEST: str = "https://github.com/ZZWaang/audio2midi"
-DEFAULT_REPO_URL_TO_TEST: str = "https://github.com/mkaz/termgraph"
+DEFAULT_REPO_URL_TO_TEST: str = "hhttps://github.com/Jiawei-Zhao-728/movie-dash"
+# DEFAULT_REPO_URL_TO_TEST: str = "https://github.com/mkaz/termgraph"
 TAKEAWAYS_FILE_PATH = os.path.join(os.path.dirname(__file__), "takeaways.txt")
 MAX_SCREEN_OUTPUT_CHARS = 2000  # Truncate output if it exceeds this length
 
@@ -136,6 +137,8 @@ class GithubRepoTesterUI(LAIAsUI):
         self.program_should_terminate: bool = False
         self.processes: tp.Dict[int, ManagedProcess] = {}
         self.summary_history: tp.List[str] = []
+        self.last_decision_snapshot = None # Full copy of the snapshot during the last decision phase
+        self.last_reasoning: str = ""
         self._lock = threading.Lock()
         
         self.current_stage: str = "Setup"
@@ -190,11 +193,13 @@ You operate in a strict **Two-Phase Loop** for every event:
 - If `cd` fails with a relative path, retry with the absolute path.
 - Never use interactive browsers or TUIs (e.g., nano, vim); interact only via text-based commands.
 - If a command is running, `set_alarm` to wait for it. Do not just loop `wait`.
+- **Stop Loop:** If you encounter the same error twice, you MUST change something (edit env) before running the command again. Do not verify without fixing.
 - **Constructive Feedback:** When reporting, provide actionable advice for the repo owner.
 - You are fully responsible for resolving any errors you encounter. Set up the environment and prepare all necessary materials yourself. Never give up until you have tried your best to debug.
 - Use python3 for python commands.
 - If you already notified something that is related to a function which is out of your testing scope while setting up, you can choose to skip that specific part.
 - All running processes will be printed on the screen. If you find a running process disappears, see that process as finished.
+
 
 ### Evaluation and Scoring
 At the end of your testing process, assign star-ratings (0.0-10.0) for each of the following criteria.
@@ -271,7 +276,7 @@ Finally, calculate and report an Overall Score (0.0-10.0) with a concise justifi
 
     SUMMARIZE_SCREEN_DEF = FunctionDefinition(
         name='summarizeScreen',
-        description="Summarize the new events on screen.",
+        description="Summarize the new events and their results on screen.",
         parameters={'type': 'object','properties': {'summary': {'type': 'string'}},'required': ['summary']},
     )
 
@@ -290,7 +295,7 @@ Finally, calculate and report an Overall Score (0.0-10.0) with a concise justifi
             (self.READ_OUTPUT_DEF, self.handle_read_output),
             (self.KILL_DEF, self.handle_kill),
             (self.REPORT_FINDINGS_DEF, self.handle_report_test_findings),
-            (self.PROPOSE_ACTION_DEF, None), 
+            # (self.PROPOSE_ACTION_DEF, None), 
         ]
 
     # --- XML Safe Helper ---
@@ -433,7 +438,6 @@ Finally, calculate and report an Overall Score (0.0-10.0) with a concise justifi
 
     async def handle_interrogation(self, last_screen: str, chat_history: tp.List[ChatCompletionMessageParam]):
         """
-        [ADAPTED FROM server.py] 
         Pauses the agent for a multi-turn conversation and gets responses from the agent.
         """
         print("\n--- AGENT PAUSED: CONVERSATION MODE ---")
@@ -441,11 +445,29 @@ Finally, calculate and report an Overall Score (0.0-10.0) with a concise justifi
         
         interrogation_history: tp.List[ChatCompletionMessageParam] = []
 
-        initial_context = (
-            f"A human operator has paused you to ask clarifying questions about your last action.\n\n"
-            f"--- LAST SCREEN YOU SAW ---\n{last_screen}\n\n"
-        )
-        interrogation_history.append({'role': 'user', 'content': initial_context})
+        if self.last_decision_snapshot:
+            # Snapshot contains: System Prompt + History + User Prompt (with Screen)
+            base_context = self.last_decision_snapshot
+            
+            audit_system_msg = {
+                'role': 'system', 
+                'content': (
+                    "You are an Auditor AI. The user is questioning the Agent's *PAST* decision.\n"
+                    "The messages above represent the EXACT state of the Agent's memory when it made its last move.\n"
+                    "Answer the user's questions about WHY the Agent took that action based on this frozen context.\n"
+                )
+            }
+            context_messages = base_context + [audit_system_msg]
+        else:
+            initial_context = (
+                f"A human operator has paused you to ask clarifying questions about your last action.\n\n"
+                f"--- LAST SCREEN YOU SAW ---\n{last_screen}\n\n"
+            )
+            context_messages = [
+                {'role': 'system', 'content': self.systemPrinciples()},
+                *chat_history,
+                {'role': 'user', 'content': initial_context}
+            ]
 
         try:
             while True:
@@ -459,16 +481,12 @@ Finally, calculate and report an Overall Score (0.0-10.0) with a concise justifi
                 interrogation_history.append({'role': 'user', 'content': question})
 
                 # Combine histories
-                messages: tp.List[ChatCompletionMessageParam] = [
-                    {'role': 'system', 'content': self.systemPrinciples()},
-                    *chat_history,
-                    *interrogation_history
-                ]
+                full_messages = context_messages + interrogation_history
 
-                print("\n🤔 Agent is thinking...")
+                print("\n Auditor is analyzing...")
                 response = await self.client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=messages,
+                    model="gpt-5",
+                    messages=full_messages,
                 )
                 answer = response.choices[0].message.content
                 print(f"\n AGENT RESPONSE:\n{answer}")
@@ -672,6 +690,8 @@ async def run_agent_event_loop(ui: GithubRepoTesterUI):
     await ui.event_queue.put(AgentEvent(type=AgentEventType.STARTUP))
     
     while not ui.program_should_terminate:
+        if len(chat_history) > 20:
+            chat_history = chat_history[-20:]
         
         # 1. Wait for an event
         try:
@@ -716,12 +736,18 @@ async def run_agent_event_loop(ui: GithubRepoTesterUI):
         # We force the LLM to summarize the screen before letting it do anything else.
         # ================================================================
         
+        prev_intent = ui.last_reasoning if ui.last_reasoning else "Initial Startup / No specific intent recorded."
+
         summary_prompt = (
             f"Current Event: {event.type.name}\n\n"
+            f"=== CONTEXT: YOUR PREVIOUS INTENT ===\n"
+            f"{prev_intent}\n"
+            f"===================================\n\n"
             f"{screen_xml}\n\n"
             f"**PHASE 1: OBSERVATION**\n"
-            f"Analyze the screen above. You MUST use the `summarizeScreen` tool to record what just happened into your long-term memory.\n"
-            f"If the event is trivial (e.g. just started a command), the summary can be very brief.\n"
+            f"Analyze the screen above. You MUST use the `summarizeScreen` tool to record what just happened into your long-term memory. Pay attention to the exact contents of the results.\n"
+            f"Compare the result in the screen with your PREVIOUS INTENT. Did you achieve your goal? Why or why not?\n"
+            f"If the event is trivial (e.g. just started a command and no output is shown), the summary can be very brief. Focus on the screen contents instead of the agent's action when summarizing.\n"
             f"Do NOT propose actions yet."
         )
         
@@ -734,10 +760,21 @@ async def run_agent_event_loop(ui: GithubRepoTesterUI):
         phase1_tools = [{'type': 'function', 'function': t[0].model_dump(exclude_none=True)} for t in ui.get_summary_tools()]
 
         try:
-            # print("[Phase 1] Force Summarize...")
-            p1_completion = await ui.client.chat.completions.create(model="gpt-4o", messages=phase1_messages, tools=phase1_tools)
+            # TO DELETE: print("[Phase 1] Force Summarize...")
+            p1_completion = await ui.client.chat.completions.create(model="gpt-5", messages=phase1_messages, tools=phase1_tools)
             p1_msg = p1_completion.choices[0].message
-            chat_history.append(p1_msg) # Add Assistant Message
+
+            assistant_text = ""
+
+            if p1_msg.content:
+                for part in p1_msg.content:
+                    if part.type == "text":
+                        assistant_text += part.text
+
+            chat_history.append({
+                "role": "assistant",
+                "content": assistant_text
+            })
             
             # Execute Summary Tool
             if p1_msg.tool_calls:
@@ -747,7 +784,8 @@ async def run_agent_event_loop(ui: GithubRepoTesterUI):
                         summary = args.get("summary", "")
                         ui.summary_history.append(summary)
                         print(f"SCREEN SUMMARY: {summary}")
-                        chat_history.append({'role': 'tool', 'tool_call_id': tc.id, 'content': "Summary recorded."})
+                        # TO DELETE: chat_history.append({'role': 'tool', 'tool_call_id': tc.id, 'content': "Summary recorded."})
+                        chat_history.append({"role": "user", "content": f"""Tool `{tc.function.name}` executed. Summary recorded."""})
             else:
                 # If LLM failed to call tool (rare with strict prompting), mock it
                 print("[WARN] LLM skipped summary. Injecting empty summary.")
@@ -762,10 +800,14 @@ async def run_agent_event_loop(ui: GithubRepoTesterUI):
         
         past_summaries = "\n".join(ui.summary_history) or "No summaries yet."
         action_prompt = (
-            f"<past_summaries>\n{past_summaries}\n</past_summaries>\n\n"
-            f"**PHASE 2: ACTION**\n"
-            f"You have summarized the latest event. Now, based on your long-term memory (above) and the current screen, decide the next step.\n"
-            f"Use `propose_next_action` to run commands, or `report_test_findings_and_terminate` if done."
+            f"=== LONG TERM MEMORY (PAST SUMMARIES) ===\n"
+            f"{past_summaries}\n"
+            f"=========================================\n\n"
+            f"=== CURRENT PERCEPTION (SCREEN) ===\n"
+            f"{screen_xml}\n"
+            f"===================================\n\n"
+            f"**PHASE 2: ACT**\n"
+            f"Based on the Memory above and the Current Screen, decide the next step."
         )
         
         phase2_messages = [
@@ -774,15 +816,22 @@ async def run_agent_event_loop(ui: GithubRepoTesterUI):
             {'role': 'user', 'content': action_prompt}
         ]
         
-        phase2_tools = [{'type': 'function', 'function': t[0].model_dump(exclude_none=True)} for t in ui.get_action_tools()]
+        phase2_tools = []
+        for func_def, _handler in ui.get_action_tools():
+            schema = func_def.model_dump(exclude_none=True)
+            phase2_tools.append({"type": "function", **schema})
 
         try:
-            # print("[Phase 2] Deciding Action...")
+            ui.last_decision_snapshot = copy.deepcopy(phase2_messages)
+
             async def execute_action_tools(tool_calls):
                 nonlocal active_alarm_task
                 for tc in tool_calls:
-                    func_name = tc.function.name
-                    args = json.loads(tc.function.arguments)
+                    # Responses API: tc.name / tc.arguments
+                    # ChatCompletions: tc.function.name / tc.function.arguments
+                    func_name = getattr(tc, "name", None) or getattr(getattr(tc, "function", None), "name", None)
+                    arg_str  = getattr(tc, "arguments", None) or getattr(getattr(tc, "function", None), "arguments", None) or "{}"
+                    args = json.loads(arg_str)
                     content_result = ""
                     
                     # Logic for all Action Tools
@@ -801,16 +850,7 @@ async def run_agent_event_loop(ui: GithubRepoTesterUI):
                         active_alarm_task = asyncio.create_task(alarm_coro())
                         print(f"ACTION: Set Alarm for {time_s}s")
                         content_result = f"Alarm set for {time_s}s."
-                    elif func_name == "propose_next_action":
-                        ui.current_stage = args.get("current_stage", ui.current_stage)
-                        print(f"LLM THOUGHT: {args.get('reasoning')}")
-                        cmd = args.get("proposed_command")
-                        if cmd:
-                            res = await ui.handle_new_shell_command(cmd)
-                            print(f"EXECUTING: {cmd}")
-                            print(f"COMMAND RESULT: {res}")
-                            content_result = res
-                        else: content_result = "Stage updated."
+                    # Note: propose_next_action is removed as we use native reasoning now
                     elif func_name == "report_test_findings_and_terminate":
                         await ui.handle_report_test_findings(**args)
                         content_result = "Report submitted."
@@ -821,18 +861,59 @@ async def run_agent_event_loop(ui: GithubRepoTesterUI):
                         res = await ui.handle_kill(**args)
                         content_result = res
                     
-                    chat_history.append({'role': 'tool', 'tool_call_id': tc.id, 'content': str(content_result)})
+                    # Append result to history for consistency within this loop iteration
+                    # TO DELETE: chat_history.append({'role': 'tool', 'tool_call_id': tc.id, 'content': str(content_result)})
+                    chat_history.append({"role": "user", "content": f"""Tool `{func_name}` executed.
+                    Result:
+                    {str(content_result)}
+                    """
+                    })
                 
-                # Close the loop
+                # Signal that tools are done executing to trigger the next loop event
                 await ui.event_queue.put(AgentEvent(type=AgentEventType.TOOL_COMPLETION))
 
-            p2_completion = await ui.client.chat.completions.create(model="gpt-5", messages=phase2_messages, tools=phase2_tools)
-            p2_msg = p2_completion.choices[0].message
-            chat_history.append(p2_msg)
+            # --- CALL OPENAI RESPONSES API ---
+            # Using client.responses.create instead of chat.completions.create
+            p2_response = await ui.client.responses.create(
+                model="gpt-5",
+                input=phase2_messages, # Parameter is 'input', not 'messages'
+                tools=phase2_tools,
+                # Enable native reasoning and request a text summary of the thought process
+                reasoning={"effort": "medium", "summary": "concise"} 
+            )
 
-            if p2_msg.tool_calls:
-                await execute_action_tools(p2_msg.tool_calls)
-            
+            # --- PARSE RESPONSE OUTPUT ---
+            # The response contains a list of items (reasoning, tool_calls, messages)
+            tool_calls_to_execute = []
+
+            ui.last_reasoning = ""
+
+            if hasattr(p2_response, 'output'):
+                for item in p2_response.output:
+                    # 1. Capture and Print Reasoning (The "Thought")
+                    if item.type == "reasoning":
+                        # The summary field usually contains the text representation
+                        if hasattr(item, 'summary') and item.summary:
+                            for part in item.summary:
+                                if getattr(part, "type", None) == "summary_text":
+                                    print(f"LLM REASONING: {part.text}")
+                                    ui.last_reasoning += part.text + "\n"
+                    
+                    # 2. Collect Tool Calls
+                    elif item.type in ("function_call", "tool_call"):
+                        tool_calls_to_execute.append(item)
+                    
+                    # 3. Handle Standard Text Message (if the model speaks instead of acting)
+                    elif item.type == "message":
+                        for content_part in item.content:
+                            if content_part.type == "text":
+                                print(f"LLM MESSAGE: {content_part.text}")
+                                ui.last_reasoning += content_part.text + "\n"
+
+
+            # Execute the collected tool calls
+            if tool_calls_to_execute:
+                await execute_action_tools(tool_calls_to_execute)
 
         except Exception as e:
             print(f"Error in Action Phase: {e}")
